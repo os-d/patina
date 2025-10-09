@@ -83,6 +83,9 @@ pub(crate) trait EfiSystemContextFactory {
 pub(crate) trait EfiExceptionStackTrace {
     /// Dump the stack trace for architecture specific context.
     fn dump_stack_trace(&self);
+
+    /// Dump system context registers for architecture specific context.
+    fn dump_system_context_registers(&self);
 }
 
 /// Trait for structs that implement and manage interrupts.

@@ -38,6 +38,106 @@ impl super::EfiExceptionStackTrace for ExceptionContextAArch64 {
             log::error!("StackTrace: {err}");
         }
     }
+
+    fn dump_system_context_registers(&self) {
+        log::error!("ESR: {:#X?}, ELR: {:#X?}, SPSR: {:#X?}, FAR: {:#X?}", self.esr, self.elr, self.spsr, self.far);
+
+        log::error!("");
+
+        log::error!("General-Purpose Registers");
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x0",
+            self.x0,
+            "x1",
+            self.x1,
+            "x2",
+            self.x2,
+            "x3",
+            self.x3
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x4",
+            self.x4,
+            "x5",
+            self.x5,
+            "x6",
+            self.x6,
+            "x7",
+            self.x7
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x8",
+            self.x8,
+            "x9",
+            self.x9,
+            "x10",
+            self.x10,
+            "x11",
+            self.x11
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x12",
+            self.x12,
+            "x13",
+            self.x13,
+            "x14",
+            self.x14,
+            "x15",
+            self.x15
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x16",
+            self.x16,
+            "x17",
+            self.x17,
+            "x18",
+            self.x18,
+            "x19",
+            self.x19
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x20",
+            self.x20,
+            "x21",
+            self.x21,
+            "x22",
+            self.x22,
+            "x23",
+            self.x23
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x24",
+            self.x24,
+            "x25",
+            self.x25,
+            "x26",
+            self.x26,
+            "x27",
+            self.x27
+        );
+        log::error!(
+            "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+            "x28",
+            self.x28,
+            "fp",
+            self.fp,
+            "lr",
+            self.lr,
+            "sp",
+            self.sp
+        );
+
+        log::error!("");
+
+        log::debug!("Full Context: {self:#X?}");
+    }
 }
 
 #[allow(unused)]

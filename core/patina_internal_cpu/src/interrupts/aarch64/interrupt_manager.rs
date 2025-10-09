@@ -8,11 +8,18 @@
 //!
 
 use core::arch::{asm, global_asm};
-use patina::{component::service::IntoService, error::EfiError};
+use patina::{
+    base::{UEFI_PAGE_MASK, UEFI_PAGE_SIZE},
+    bit,
+    component::service::IntoService,
+    error::EfiError,
+};
+use patina_paging::{PageTable, PagingType};
+use patina_stacktrace::StackTrace;
 
-use crate::interrupts::InterruptManager;
 #[cfg(all(not(test), target_arch = "aarch64"))]
 use crate::interrupts::aarch64::sysreg::{read_sysreg, write_sysreg};
+use crate::interrupts::{EfiSystemContext, HandlerType, InterruptManager, exception_handling::FaultAllocator};
 use crate::interrupts::{disable_interrupts, enable_interrupts};
 
 #[cfg(all(not(test), target_arch = "aarch64"))]
@@ -46,7 +53,12 @@ impl InterruptsAarch64 {
     ///
     pub fn initialize(&mut self) -> Result<(), EfiError> {
         // Initialize exception entrypoint
-        initialize_exception()
+        initialize_exception()?;
+
+        self.register_exception_handler(0, HandlerType::UefiRoutine(synchronous_exception_handler))
+            .expect("Failed to install default exception handler!");
+
+        Ok(())
     }
 }
 
@@ -129,4 +141,158 @@ fn initialize_exception() -> Result<(), EfiError> {
     enable_async_abort();
 
     Ok(())
+}
+
+/// Default handler for synchronous exceptions.
+extern "efiapi" fn synchronous_exception_handler(_exception_type: isize, context: EfiSystemContext) {
+    let aarch64_context = unsafe { context.system_context_aarch64.as_ref().unwrap() };
+
+    log::error!("");
+    log::error!("EXCEPTION: Synchronous Exception");
+    log::error!("");
+    log::error!(
+        "ESR: {:#X?}, ELR: {:#X?}, SPSR: {:#X?}, FAR: {:#X?}",
+        aarch64_context.esr,
+        aarch64_context.elr,
+        aarch64_context.spsr,
+        aarch64_context.far
+    );
+
+    log::error!("");
+
+    // determine if this was a page fault
+    let ec = (aarch64_context.esr >> 26) & 0x3F;
+    let iss = aarch64_context.esr & 0xFFFFFF;
+    let page_fault = ec == 0x20 || ec == 0x21 || ec == 0x24 || ec == 0x25;
+    if ec == 0x20 || ec == 0x21 {
+        // Instruction Abort from a lower EL or same EL
+        log::error!("Page Fault (Instruction Abort)");
+    } else if ec == 0x24 || ec == 0x25 {
+        // Data Abort from a lower EL or same EL
+        log::error!("Page Fault (Data Abort)");
+    }
+
+    log::error!("");
+
+    log::error!("General-Purpose Registers");
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x0",
+        aarch64_context.x0,
+        "x1",
+        aarch64_context.x1,
+        "x2",
+        aarch64_context.x2,
+        "x3",
+        aarch64_context.x3
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x4",
+        aarch64_context.x4,
+        "x5",
+        aarch64_context.x5,
+        "x6",
+        aarch64_context.x6,
+        "x7",
+        aarch64_context.x7
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x8",
+        aarch64_context.x8,
+        "x9",
+        aarch64_context.x9,
+        "x10",
+        aarch64_context.x10,
+        "x11",
+        aarch64_context.x11
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x12",
+        aarch64_context.x12,
+        "x13",
+        aarch64_context.x13,
+        "x14",
+        aarch64_context.x14,
+        "x15",
+        aarch64_context.x15
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x16",
+        aarch64_context.x16,
+        "x17",
+        aarch64_context.x17,
+        "x18",
+        aarch64_context.x18,
+        "x19",
+        aarch64_context.x19
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x20",
+        aarch64_context.x20,
+        "x21",
+        aarch64_context.x21,
+        "x22",
+        aarch64_context.x22,
+        "x23",
+        aarch64_context.x23
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x24",
+        aarch64_context.x24,
+        "x25",
+        aarch64_context.x25,
+        "x26",
+        aarch64_context.x26,
+        "x27",
+        aarch64_context.x27
+    );
+    log::error!(
+        "{:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}  {:>4}: {:#018X}",
+        "x28",
+        aarch64_context.x28,
+        "fp",
+        aarch64_context.fp,
+        "lr",
+        aarch64_context.lr,
+        "sp",
+        aarch64_context.sp
+    );
+
+    log::error!("");
+
+    if page_fault {
+        // make sure the FAR is valid before we dump the page table
+        if iss & bit!(10) == 0 {
+            dump_pte(aarch64_context.far);
+        } else {
+            log::error!("FAR not valid, not dumping PTE");
+        }
+    }
+
+    log::debug!("Full Context: {aarch64_context:#X?}");
+
+    log::error!("Dumping Exception Stack Trace:");
+    if let Err(err) = unsafe { StackTrace::dump_with(aarch64_context.elr, aarch64_context.sp) } {
+        log::error!("StackTrace: {err}");
+    }
+
+    // no need to print anything here, we already did
+    panic!("");
+}
+
+fn dump_pte(far: u64) {
+    let ttbr0_el2 = unsafe { read_sysreg!(ttbr0_el2) };
+
+    if let Ok(pt) = unsafe {
+        patina_paging::aarch64::AArch64PageTable::from_existing(ttbr0_el2, FaultAllocator {}, PagingType::Paging4Level)
+    } {
+        let _ = pt.dump_page_tables(far & !(UEFI_PAGE_MASK as u64), UEFI_PAGE_SIZE as u64);
+        log::error!("");
+    }
 }

@@ -39,6 +39,10 @@ impl StackTrace {
         let mut sp = sp;
         let mut i = 0;
 
+        let mut j = 0;
+
+        while unsafe { core::ptr::read_volatile(&j) == 0 } {}
+
         log::info!("Dumping stack trace with PC: {pc:#x}, SP: {sp:#x}");
 
         log::info!("      # Child-SP              Return Address         Call Site");
