@@ -7,7 +7,7 @@
 //! SPDX-License-Identifier: Apache-2.0
 //!
 
-use core::arch::{asm, global_asm};
+use core::arch::global_asm;
 use patina::{
     base::{UEFI_PAGE_MASK, UEFI_PAGE_SIZE},
     bit,
@@ -68,21 +68,17 @@ impl InterruptsAarch64 {
 impl InterruptManager for InterruptsAarch64 {}
 
 fn enable_fiq() {
-    unsafe {
-        asm!("msr   daifclr, 0x01", "isb sy", options(nostack));
-    }
+    write_sysreg!(daifclr, 0x01, "isb sy");
 }
 
 fn disable_fiq() {
-    unsafe {
-        asm!("msr   daifset, 0x01", "isb sy", options(nostack));
-    }
+    write_sysreg!(daifset, 0x01, "isb sy");
 }
 
 fn get_fiq_state() -> Result<bool, EfiError> {
     #[cfg(all(not(test), target_arch = "aarch64"))]
     {
-        let daif = unsafe { read_sysreg!(daif) };
+        let daif = read_sysreg!(daif);
         Ok(daif & 0x40 == 0)
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -94,9 +90,7 @@ fn get_fiq_state() -> Result<bool, EfiError> {
 fn enable_async_abort() {
     #[cfg(all(not(test), target_arch = "aarch64"))]
     {
-        unsafe {
-            asm!("msr   daifclr, 0x04", "isb sy", options(nostack));
-        }
+        write_sysreg!(daifclr, 0x04, "isb sy");
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -107,10 +101,11 @@ fn enable_async_abort() {
 fn initialize_exception() -> Result<(), EfiError> {
     // Set the stack pointer for EL0 to be used for synchronous exceptions
     #[cfg(all(not(test), target_arch = "aarch64"))]
-    unsafe {
-        let mut sp_el0_reg = &sp_el0_end as *const _ as u64;
+    {
+        // SAFETY: We are using the address of a symbol defined in assembly as the stack pointer for EL0.
+        let mut sp_el0_reg = unsafe { &sp_el0_end as *const _ as u64 };
         sp_el0_reg &= !0x0F;
-        asm!("msr sp_el0, {}", in(reg) sp_el0_reg, options(nostack));
+        write_sysreg!(sp_el0, sp_el0_reg);
 
         let mut hcr = read_sysreg!(hcr_el2) as u64;
         hcr = hcr as u64 | 1 << 27; // Enable TGE
@@ -120,12 +115,12 @@ fn initialize_exception() -> Result<(), EfiError> {
     // Program VBar
     #[cfg(all(not(test), target_arch = "aarch64"))]
     {
+        // SAFETY: We are using the address of the exception handlers as the vector base address.
         let vec_base = unsafe { &exception_handlers_start as *const _ as u64 };
         let current_el = get_current_el();
         match current_el {
-            0xC => unsafe { write_sysreg!(vbar_el1, vec_base, "isb sy") },
-            0x08 => unsafe { write_sysreg!(vbar_el2, vec_base, "isb sy") },
-            0x04 => unsafe { write_sysreg!(vbar_el3, vec_base, "isb sy") },
+            0xC => write_sysreg!(vbar_el1, vec_base, "isb sy"),
+            0x08 => write_sysreg!(vbar_el2, vec_base, "isb sy"),
             _ => panic!("Invalid current EL {}", current_el),
         };
     }
@@ -197,8 +192,9 @@ extern "efiapi" fn synchronous_exception_handler(_exception_type: isize, context
 }
 
 fn dump_pte(far: u64) {
-    let ttbr0_el2 = unsafe { read_sysreg!(ttbr0_el2) };
+    let ttbr0_el2 = read_sysreg!(ttbr0_el2);
 
+    // SAFETY: We are reading TTBR0_EL2 directly and using it to create the page table, which is what the HW does.
     if let Ok(pt) = unsafe {
         patina_paging::aarch64::AArch64PageTable::from_existing(ttbr0_el2, FaultAllocator {}, PagingType::Paging4Level)
     } {
