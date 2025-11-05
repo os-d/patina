@@ -262,6 +262,7 @@ impl PageAllocator for PagingAllocator<'_> {
                         None,
                     ) {
                         Ok(addr) => {
+                            log::info!("OSDDEBUG allocated {} pages for page table page pool at {:#x}", len, addr);
                             for i in 0..len {
                                 self.page_pool.push(addr as u64 + ((i * UEFI_PAGE_SIZE) as u64));
                             }
