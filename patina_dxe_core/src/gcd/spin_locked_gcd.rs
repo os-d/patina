@@ -2423,13 +2423,17 @@ impl SpinLockedGcd {
         &self,
         base_address: usize,
         len: usize,
-        attributes: u64,
+        mut attributes: u64,
     ) -> Result<(), EfiError> {
         // this API allows for setting attributes across multiple descriptors in the GCD (assuming the capabilities
         // allow it). The lower level set_memory_space_attributes will only operate on a single entry in the GCD/page
         // table, so at this level we need to check to see if the range spans multiple entries and if so, we need to
         // split the range and call set_memory_space_attributes for each entry. We also need to set the paging
         // attributes per entry to ensure that we keep the GCD and page table in sync
+
+        if attributes & efi::MEMORY_UC == efi::MEMORY_UC {
+            attributes |= efi::MEMORY_XP;
+        }
 
         let mut current_base = base_address as u64;
         let mut res = Ok(());
