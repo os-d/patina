@@ -11,13 +11,14 @@ mod memory_block;
 mod spin_locked_gcd;
 
 use alloc::string::String;
+use goblin::pe::section_table;
 
 use core::{ffi::c_void, ops::Range};
 use patina::{
     base::{align_down, align_up},
     error::EfiError,
     pi::{
-        dxe_services::{GcdIoType, GcdMemoryType},
+        dxe_services::{GcdIoType, GcdMemoryType, MemorySpaceDescriptor},
         hob::{self, Hob, HobList, PhaseHandoffInformationTable},
     },
 };
@@ -27,7 +28,7 @@ use r_efi::efi;
 #[cfg(feature = "compatibility_mode_allowed")]
 use patina::base::{UEFI_PAGE_SIZE, align_range};
 
-use crate::{GCD, gcd::spin_locked_gcd::PagingAllocator};
+use crate::{GCD, gcd::spin_locked_gcd::PagingAllocator, pecoff};
 
 pub use spin_locked_gcd::{AllocateType, MapChangeType, SpinLockedGcd};
 
@@ -136,6 +137,41 @@ impl MemoryProtectionPolicy {
     /// Use Case: This is called when loading an image to ensure the stack guard page is protected.
     pub(crate) fn apply_image_stack_guard_policy(attributes: u64) -> u64 {
         attributes | efi::MEMORY_RP
+    }
+
+    /// Rule: All loaded image sections must have memory protections applied based on the section type.
+    ///   - Code sections are marked as Read Only and Executable
+    ///   - Data sections are marked as Read/Write and Non-Executable
+    ///   - Sections w/o the write characteristic are marked as Read Only
+    /// The cache attributes from the memory space descriptor are preserved.
+    ///
+    /// Arguments
+    /// * `section_base_addr` - The base address of the section being loaded
+    /// * `section_characteristics` - The PE/COFF section characteristics
+    ///
+    /// Returns a tuple of (attributes, capabilities) to be applied to the section
+    ///
+    /// Use Case: This is called when loading an image to ensure each section has the proper memory protections.
+    pub(crate) fn apply_image_protection_policy(
+        section_characteristics: u32,
+        descriptor: &MemorySpaceDescriptor,
+    ) -> Result<(u64, u64), EfiError> {
+        let mut attributes = efi::MEMORY_XP;
+        if section_characteristics & pecoff::IMAGE_SCN_CNT_CODE == pecoff::IMAGE_SCN_CNT_CODE {
+            attributes = efi::MEMORY_RO;
+        }
+
+        if section_characteristics & section_table::IMAGE_SCN_MEM_WRITE == 0
+            && ((section_characteristics & section_table::IMAGE_SCN_MEM_READ) == section_table::IMAGE_SCN_MEM_READ)
+        {
+            attributes |= efi::MEMORY_RO;
+        }
+
+        attributes |= descriptor.attributes & efi::CACHE_ATTRIBUTE_MASK;
+
+        let capabilities = attributes | descriptor.capabilities;
+
+        Ok((attributes, capabilities))
     }
 
     /// Rule: If the compatibility_mode_allowed feature flag is not set, we will fail to load

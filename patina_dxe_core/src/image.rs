@@ -8,7 +8,6 @@
 //!
 use alloc::{boxed::Box, collections::BTreeMap, string::String, vec, vec::Vec};
 use core::{convert::TryInto, ffi::c_void, mem::transmute, slice, slice::from_raw_parts};
-use goblin::pe::section_table;
 use patina::{
     base::{DEFAULT_CACHE_ATTR, UEFI_PAGE_SIZE, align_up},
     error::EfiError,
@@ -285,6 +284,7 @@ impl Drop for PrivateImageData {
                 self.image_base_page,
                 self.image_num_pages
             );
+            debug_assert!(false);
         }
 
         if let (Some(resource_addr), Some(num_pages)) =
@@ -294,6 +294,7 @@ impl Drop for PrivateImageData {
             log::error!(
                 "core_free_pages returned error {status:#x?} for HII resource section at {resource_addr:#x} for num_pages {num_pages:#x}",
             );
+            debug_assert!(false);
         }
     }
 }
@@ -357,40 +358,14 @@ fn empty_image_info() -> efi::protocols::loaded_image::Protocol {
 
 fn apply_image_memory_protections(pe_info: &UefiPeInfo, private_info: &PrivateImageData) -> Result<(), EfiError> {
     for section in &pe_info.sections {
-        let mut attributes = efi::MEMORY_XP;
-        if section.characteristics & pecoff::IMAGE_SCN_CNT_CODE == pecoff::IMAGE_SCN_CNT_CODE {
-            attributes = efi::MEMORY_RO;
-        }
-
-        if section.characteristics & section_table::IMAGE_SCN_MEM_WRITE == 0
-            && ((section.characteristics & section_table::IMAGE_SCN_MEM_READ) == section_table::IMAGE_SCN_MEM_READ)
-        {
-            attributes |= efi::MEMORY_RO;
-        }
-
         // each section starts at image_base + virtual_address, per PE/COFF spec.
         let section_base_addr = (private_info.image_info.image_base as u64) + (section.virtual_address as u64);
 
-        let mut capabilities = attributes;
-
         // we need to get the current attributes for this region and add our new attribute
         // if we can't find this range in the GCD, try the next one, but report the failure
-        match dxe_services::core_get_memory_space_descriptor(section_base_addr) {
-            // in the Ok case, keep the cache attributes, but remove the existing memory attributes
-            // all new memory has efi::MEMORY_XP set, so we need to remove this if this is becoming a code
-            // section
-            Ok(desc) => {
-                attributes |= desc.attributes & !efi::MEMORY_ACCESS_MASK;
-                capabilities |= desc.capabilities;
-            }
-            Err(status) => {
-                log::error!(
-                    "Failed to find GCD desc for image section {section_base_addr:#X} with Status {status:#X?}",
-                );
-                debug_assert!(false);
-                return Err(status);
-            }
-        }
+        let desc = dxe_services::core_get_memory_space_descriptor(section_base_addr)?;
+        let (attributes, capabilities) =
+            MemoryProtectionPolicy::apply_image_protection_policy(section.characteristics, &desc)?;
 
         // now actually set the attributes. We need to use the virtual size for the section length, but
         // we cannot rely on this to be section aligned, as some compilers rely on the loader to align this
@@ -433,48 +408,6 @@ fn apply_image_memory_protections(pe_info: &UefiPeInfo, private_info: &PrivateIm
             })?;
     }
     Ok(())
-}
-
-fn remove_image_memory_protections(pe_info: &UefiPeInfo, private_info: &PrivateImageData) {
-    for section in &pe_info.sections {
-        // each section starts at image_base + virtual_address, per PE/COFF spec.
-        let section_base_addr = (private_info.image_info.image_base as u64) + (section.virtual_address as u64);
-
-        // we need to get the current attributes for this region and remove our attributes
-        // we need to reset this to efi::MEMORY_XP so that we can merge all of the pages allocated for this image
-        // together. Any unaligned memory will still have efi::MEMORY_XP set
-        match dxe_services::core_get_memory_space_descriptor(section_base_addr) {
-            Ok(desc) => {
-                let attributes = desc.attributes & !efi::MEMORY_ATTRIBUTE_MASK | efi::MEMORY_XP;
-
-                // now set the attributes back to only caching attrs.
-                let aligned_virtual_size =
-                    if let Ok(virtual_size) = align_up(section.virtual_size, pe_info.section_alignment) {
-                        virtual_size as u64
-                    } else {
-                        log::error!(
-                            "Failed to align up section size {:#X} with alignment {:#X}",
-                            section.virtual_size,
-                            pe_info.section_alignment,
-                        );
-                        debug_assert!(false);
-                        continue;
-                    };
-                if let Err(status) =
-                    dxe_services::core_set_memory_space_attributes(section_base_addr, aligned_virtual_size, attributes)
-                {
-                    log::error!(
-                        "Failed to remove GCD attributes for image section {section_base_addr:#X} with Status {status:#X?}",
-                    );
-                }
-            }
-            Err(status) => {
-                log::error!(
-                    "Failed to find GCD desc for image section {section_base_addr:#X} with Status {status:#X?}, cannot remove memory protections",
-                );
-            }
-        }
-    }
 }
 
 // retrieves the dxe core image info from the hob list, and installs the
@@ -1369,11 +1302,6 @@ pub fn core_unload_image(image_handle: efi::Handle, force_unload: bool) -> Resul
     {
         log::error!("Failed to remove runtime image for handle {image_handle:?}: {err:?}");
     }
-
-    // we have to remove the memory protections from the image sections before freeing the image buffer, because
-    // core_free_pages expects the memory being freed to be in a single continuous memory descriptor, which is not
-    // true when we've changed the attributes per section
-    remove_image_memory_protections(&private_image_data.pe_info, &private_image_data);
 
     Ok(())
 }
