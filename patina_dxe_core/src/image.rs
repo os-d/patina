@@ -36,6 +36,7 @@ use crate::{
     dxe_services::{self, core_set_memory_space_attributes},
     events::EVENT_DB,
     filesystems::SimpleFile,
+    gcd::MemoryProtectionPolicy,
     pecoff::{self, UefiPeInfo, relocation::RelocationBlock},
     protocol_db,
     protocols::{
@@ -88,13 +89,14 @@ impl ImageStack {
         // attempt to set the memory space attributes for the stack guard page.
         // if we fail, we should still try to continue to boot
         // the stack grows downwards, so stack here is the guard page
-        let attributes = match dxe_services::core_get_memory_space_descriptor(stack) {
+        let mut attributes = match dxe_services::core_get_memory_space_descriptor(stack) {
             Ok(descriptor) => descriptor.attributes,
             Err(_) => DEFAULT_CACHE_ATTR,
         };
-        if let Err(err) =
-            dxe_services::core_set_memory_space_attributes(stack, UEFI_PAGE_SIZE as u64, attributes | efi::MEMORY_RP)
-        {
+
+        attributes = MemoryProtectionPolicy::apply_image_stack_guard_policy(attributes);
+
+        if let Err(err) = dxe_services::core_set_memory_space_attributes(stack, UEFI_PAGE_SIZE as u64, attributes) {
             log::error!("Failed to set memory space attributes for stack guard page: {err:?}");
             // unfortunately, this needs to be commented out for now, because the tests have gotten too complex
             // and need to be refactored to handle the page table
@@ -116,24 +118,6 @@ impl Drop for ImageStack {
             // we added a guard page, so we need to subtract a page from the stack pointer to free everything
             let stack_addr = self.stack as *const u64 as efi::PhysicalAddress - UEFI_PAGE_SIZE as u64;
 
-            // we need to set the guard page back to XP so that the pages can be coalesced before we free them
-            // preserve the caching attributes
-            let mut attributes = match dxe_services::core_get_memory_space_descriptor(stack_addr) {
-                Ok(descriptor) => descriptor.attributes & !efi::MEMORY_ATTRIBUTE_MASK,
-                Err(_) => DEFAULT_CACHE_ATTR,
-            };
-
-            attributes |= efi::MEMORY_XP;
-            if let Err(err) =
-                dxe_services::core_set_memory_space_attributes(stack_addr, UEFI_PAGE_SIZE as u64, attributes)
-            {
-                log::error!("Failed to set memory space attributes for stack guard page: {err:?}");
-                // unfortunately, this needs to be commented out for now, because the tests have gotten too complex
-                // and need to be refactored to handle the page table
-                // debug_assert!(false);
-                // if we failed, let's still try to free
-            }
-
             if let Err(status) = core_free_pages(stack_addr, self.allocated_pages) {
                 log::error!(
                     "core_free_pages returned error {:#x?} for image stack at {:#x} for num_pages {:#x}",
@@ -141,6 +125,7 @@ impl Drop for ImageStack {
                     stack_addr,
                     self.allocated_pages
                 );
+                debug_assert!(false);
             }
         }
     }
@@ -679,7 +664,11 @@ fn core_load_pe_image(
             // we are trying to load an application image that is not NX compatible, likely a bootloader
             // if we are configured to allow compatibility mode, we need to activate it now. Otherwise, just continue
             // to load the image
-            activate_compatibility_mode(&private_info)?;
+            MemoryProtectionPolicy::activate_compatibility_mode(
+                private_info.image_info.image_base as usize,
+                private_info.image_info.image_size as usize,
+                pe_info.filename.clone().unwrap_or(String::from("Unknown")),
+            )?;
         }
         _ => {
             // finally, update the GCD attributes for this image so that code sections have RO set and data sections
@@ -689,44 +678,6 @@ fn core_load_pe_image(
     }
 
     Ok(private_info)
-}
-
-#[cfg(feature = "compatibility_mode_allowed")]
-/// Activates compatibility mode for an image that is not NX compatible if the feature flag is set to allow compat mode
-/// This function will map the image as RWX in the GCD and initiate compatibility mode in the GCD
-fn activate_compatibility_mode(private_info: &PrivateImageData) -> Result<(), EfiError> {
-    log::error!("Attempting to load an application image that is not NX compatible. Activating compatibility mode.");
-    crate::gcd::activate_compatibility_mode();
-    // for this image map all mem RWX preserving cache attributes if we find them
-    let stripped_attrs = dxe_services::core_get_memory_space_descriptor(private_info.image_base_page)
-        .map(|desc| desc.attributes & efi::CACHE_ATTRIBUTE_MASK)
-        .unwrap_or(DEFAULT_CACHE_ATTR);
-    if dxe_services::core_set_memory_space_attributes(
-        private_info.image_base_page,
-        patina::uefi_pages_to_size!(private_info.image_num_pages) as u64,
-        stripped_attrs,
-    )
-    .is_err()
-    {
-        // if we failed to map this image RWX, we should still attempt to execute it, it may succeed
-        log::error!(
-            "Failed to set GCD attributes for image {}",
-            private_info.pe_info.filename.clone().unwrap_or(String::from("Unknown"))
-        );
-        debug_assert!(false);
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "compatibility_mode_allowed"))]
-/// If the compatibility_mode_allowed feature flag is not set, we will fail to load the image that would crash the
-/// system with memory protections enabled
-fn activate_compatibility_mode(private_info: &PrivateImageData) -> Result<(), EfiError> {
-    log::error!(
-        "Attempting to load {} that is not NX compatible. Compatibility mode is not allowed in this build, not loading image.",
-        private_info.pe_info.filename.clone().unwrap_or(String::from("Unknown"))
-    );
-    Err(EfiError::LoadError)
 }
 
 extern "efiapi" fn runtime_image_protection_fixup_ebs(event: efi::Event, _context: *mut c_void) {

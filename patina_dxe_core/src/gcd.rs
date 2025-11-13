@@ -10,6 +10,8 @@ mod io_block;
 mod memory_block;
 mod spin_locked_gcd;
 
+use alloc::string::String;
+
 use core::{ffi::c_void, ops::Range};
 use patina::{
     base::{align_down, align_up},
@@ -28,6 +30,261 @@ use patina::base::{UEFI_PAGE_SIZE, align_range};
 use crate::{GCD, gcd::spin_locked_gcd::PagingAllocator};
 
 pub use spin_locked_gcd::{AllocateType, MapChangeType, SpinLockedGcd};
+
+/// The MemoryProtectionPolicy struct is the source of truth for Patina's memory protection rules.
+/// All memory protection decisions in Patina are driven by functions in this struct to have one
+/// easily auditable location.
+///
+/// All rules in this struct are associated functions (don't require an instantiation of the struct)
+/// except for the apply_default_allocated_memory_protection_policy function, because this relies on
+/// internal state. The GCD contains a MemoryProtectionPolicy instance to manage this state.
+pub(crate) struct MemoryProtectionPolicy {
+    /// The default attributes for memory allocations. This will be efi::MEMORY_XP unless
+    /// we have entered compatibility mode, in which case it is 0, e.g. no protection
+    memory_allocation_default_attributes: u64,
+}
+
+impl MemoryProtectionPolicy {
+    /// Create a new MemoryProtectionPolicy instance with default settings.
+    pub(crate) const fn new() -> Self {
+        Self { memory_allocation_default_attributes: efi::MEMORY_XP }
+    }
+
+    /// Rule: All memory allocations will be marked as the set cache type with NX applied. If compatibility mode
+    /// has been activated, no protections will be applied.
+    ///
+    /// Arguments
+    /// * `attributes` - The cache attributes to apply to the allocated memory
+    ///
+    /// Use Case: This is called whenever memory is allocated via the GCD to ensure
+    /// allocated memory is NX by default.
+    pub(crate) fn apply_allocated_memory_protection_policy(&self, attributes: u64) -> u64 {
+        (attributes & efi::CACHE_ATTRIBUTE_MASK) | self.memory_allocation_default_attributes
+    }
+
+    /// Rule: All resource descriptor HOBs are initially mapped as the supplied cache attribute
+    /// (for Resource Descriptor v2 HOBs) with NX applied. All system memory is marked as RP because
+    /// we default to it being unmapped until allocated. Reserved and MMIO memory we must map by default
+    /// to preserve compatibility with drivers that expect to be able to access those regions automatically.
+    ///
+    /// Arguments
+    /// * `attributes` - The memory attributes from the resource descriptor HOB (if applicable)
+    /// * `memory_type` - The GCD memory type being mapped
+    ///
+    /// Use Case: This is called when we are processing the initial resource descriptor HOBs into the GCD.
+    pub(crate) fn apply_resc_desc_hobs_protection_policy(mut attributes: u64, memory_type: GcdMemoryType) -> u64 {
+        attributes = (attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_XP;
+
+        if memory_type == GcdMemoryType::SystemMemory {
+            attributes |= efi::MEMORY_RP;
+        }
+
+        attributes
+    }
+
+    /// Rule: If we have Uncached memory, we must also apply NX to it.
+    /// In DXE, we should never be executing from UC memory. On AArch64, this is defined as
+    /// a programming error to have executable device memory (which UC maps to).
+    ///
+    /// Arguments
+    /// * `attributes` - The memory attributes to evaluate whether NX needs to be applied
+    ///
+    /// Use Case: This is called whenever memory attributes are being set in the GCD to ensure
+    /// that Uncached memory is not executable.
+    pub(crate) fn apply_nx_to_uc_policy(mut attributes: u64) -> u64 {
+        if attributes & efi::MEMORY_UC == efi::MEMORY_UC {
+            attributes |= efi::MEMORY_XP;
+        }
+
+        attributes
+    }
+
+    /// Rule: The Memory Attributes Table, per UEFI spec, may only have RO, XP, and Runtime set. Only
+    /// RuntimeServicesCode and RuntimeServicesData are reported in the MAT. RuntimeServicesCode memory consists
+    /// of code sections, data sections, and potentially extra unused memory for padding.
+    ///   - If a Runtime Services Code region has no attributes set, mark it as RO, XP, and Runtime. This will
+    ///     prevent unused memory from being executed or written to.
+    ///   - If a Runtime Services Data region has no attributes set, mark it as XP and Runtime to ensure data can be
+    ///     used but not executed.
+    ///   - Otherwise, filter the attributes to only the allowed attributes
+    ///
+    /// Arguments
+    /// * `attributes` - The memory attributes for this region
+    /// * `memory_type` - The GCD memory type for this region
+    ///
+    /// Use Case: This is called when building the Memory Attributes Table prior to installing it.
+    pub(crate) fn apply_memory_attributes_table_policy(attributes: u64, memory_type: efi::MemoryType) -> u64 {
+        const ALLOWED_MAT_ATTRIBUTES: u64 = efi::MEMORY_RO | efi::MEMORY_XP | efi::MEMORY_RUNTIME;
+
+        match attributes & (efi::MEMORY_RO | efi::MEMORY_XP) {
+            // if we don't have any attributes set here, we should mark code as RO and XP. These are
+            // likely extra sections in the memory bins and so should not be used
+            // Data we will mark as XP only, as likely the caching attributes were changed, which
+            // dropped the XP attribute, so we need to set it here.
+            0 if memory_type == efi::RUNTIME_SERVICES_CODE => ALLOWED_MAT_ATTRIBUTES,
+            0 if memory_type == efi::RUNTIME_SERVICES_DATA => efi::MEMORY_RUNTIME | efi::MEMORY_XP,
+            _ => attributes & ALLOWED_MAT_ATTRIBUTES,
+        }
+    }
+
+    /// Rule: All loaded image stacks must have a guard page that is unmapped. We accomplish that by setting
+    /// the RP attribute on the guard page.
+    ///
+    /// Arguments
+    /// * `attributes` - The memory attributes for the stack guard page
+    ///
+    /// Use Case: This is called when loading an image to ensure the stack guard page is protected.
+    pub(crate) fn apply_image_stack_guard_policy(attributes: u64) -> u64 {
+        attributes | efi::MEMORY_RP
+    }
+
+    /// Rule: If the compatibility_mode_allowed feature flag is not set, we will fail to load
+    /// the image that would crash the system with memory protections enabled
+    #[cfg(not(feature = "compatibility_mode_allowed"))]
+    pub(crate) fn activate_compatibility_mode(
+        _image_base_page: usize,
+        _image_num_pages: usize,
+        filename: String,
+    ) -> Result<(), EfiError> {
+        log::error!(
+            "Attempting to load {} that is not NX compatible. Compatibility mode is not allowed in this build, not loading image.",
+            filename
+        );
+        Err(EfiError::LoadError)
+    }
+
+    /// Rule: If the platform allows compatibility mode, activate it when an EFI_APPLICATION without the NX_COMPAT flag
+    /// is loaded.
+    /// This will:
+    /// - Activate compatibility mode for the GCD lower layers
+    /// - Set the memory space attributes for all memory ranges in the loader code and data allocators to be RWX
+    /// - Uninstall the memory attributes protocol
+    #[cfg(feature = "compatibility_mode_allowed")]
+    pub(crate) fn activate_compatibility_mode(
+        image_base_page: usize,
+        image_num_pages: usize,
+        filename: String,
+    ) -> Result<(), EfiError> {
+        const LEGACY_BIOS_WB_ADDRESS: usize = 0xA0000;
+
+        log::warn!("Attempting to load an application image that is not NX compatible. Activating compatibility mode.");
+
+        // always map page 0 if it exists in this system, as grub will attempt to read it for legacy boot structures
+        // map it WB by default, because 0 is being used as the null page, it may not have gotten cache attributes
+        // populated
+        if let Ok(descriptor) = GCD.get_memory_descriptor_for_address(0)
+            // set_memory_space_attributes will set both the GCD and paging attributes
+            && descriptor.memory_type != GcdMemoryType::NonExistent
+            && let Err(e) = GCD.set_memory_space_attributes(0, UEFI_PAGE_SIZE, efi::MEMORY_WB)
+        {
+            log::error!("Failed to map page 0 for compat mode. Status: {e:#x?}");
+            debug_assert!(false);
+        }
+
+        // map legacy region if system mem
+        let mut address = UEFI_PAGE_SIZE; // start at 0x1000, as we already mapped page 0
+        while address < LEGACY_BIOS_WB_ADDRESS {
+            let mut size = UEFI_PAGE_SIZE;
+            if let Ok(descriptor) = GCD.get_memory_descriptor_for_address(address as efi::PhysicalAddress) {
+                // if the legacy region is not system memory, we should not map it
+                if descriptor.memory_type == GcdMemoryType::SystemMemory {
+                    size = match address + descriptor.length as usize {
+                        end_addr if end_addr > LEGACY_BIOS_WB_ADDRESS => LEGACY_BIOS_WB_ADDRESS - address,
+                        _ => descriptor.length as usize,
+                    };
+
+                    // set_memory_space_attributes will set both the GCD and paging attributes
+                    match GCD.set_memory_space_attributes(
+                        address,
+                        size,
+                        descriptor.attributes & efi::CACHE_ATTRIBUTE_MASK,
+                    ) {
+                        Ok(_) => {}
+                        Err(e) => {
+                            log::error!(
+                                "Failed to map legacy bios region at {:#x?} of length {:#x?} with attributes {:#x?}. Status: {:#x?}",
+                                address,
+                                size,
+                                descriptor.attributes & efi::CACHE_ATTRIBUTE_MASK,
+                                e
+                            );
+                            debug_assert!(false);
+                        }
+                    }
+                }
+            }
+            address += size;
+        }
+
+        // if the allocator doesn't have any memory, then when it is used next it will allocate from the GCD
+        // and the GCD will be in compatibility mode, so we don't care here
+        let mut loader_mem_ranges = crate::allocator::get_memory_ranges_for_memory_type(efi::LOADER_CODE);
+        loader_mem_ranges.extend(crate::allocator::get_memory_ranges_for_memory_type(efi::LOADER_DATA));
+        for range in loader_mem_ranges.iter() {
+            let mut addr = range.start;
+            while addr < range.end {
+                let mut len = UEFI_PAGE_SIZE as u64;
+                match GCD.get_memory_descriptor_for_address(addr) {
+                    Ok(descriptor) => {
+                        let attributes = descriptor.attributes & !efi::MEMORY_XP;
+                        len = match descriptor.base_address + descriptor.length {
+                            end if end > range.end => range.end - addr,
+                            _ => descriptor.length,
+                        };
+
+                        // We need to ensure we are operating on page aligned addresses and lengths, as the image(s) that
+                        // were allocated here may not be page aligned. We don't share pools across types, so this is safe.
+                        (addr, len) = match align_range(addr, len, UEFI_PAGE_SIZE as u64) {
+                            Ok((aligned_addr, aligned_len)) => (aligned_addr, aligned_len),
+                            Err(_) => {
+                                log::error!(
+                                    "Failed to align address {addr:#x?} + {len:#x?} to page size, compatibility mode may fail",
+                                );
+                                debug_assert!(false);
+
+                                // If we can't align the address, we can't set the attributes, so try the next range
+                                addr += len;
+                                continue;
+                            }
+                        };
+
+                        if GCD.set_memory_space_attributes(addr as usize, len as usize, attributes).is_err() {
+                            log::error!(
+                                "Failed to set memory space attributes for range {addr:#x?} - {len:#x?}, compatibility mode may fail",
+                            );
+                            debug_assert!(false);
+                        }
+                    }
+                    _ => {
+                        log::error!(
+                            "Failed to get memory space descriptor for range {:#x?} - {:#x?}, compatibility mode may fail",
+                            range.start,
+                            range.end,
+                        );
+                        debug_assert!(false);
+                    }
+                }
+                addr += len;
+            }
+        }
+        crate::memory_attributes_protocol::uninstall_memory_attributes_protocol();
+
+        // for this image map all mem RWX preserving cache attributes if we find them
+        let stripped_attrs = GCD
+            .get_memory_descriptor_for_address(image_base_page as u64)
+            .map(|desc| desc.attributes & efi::CACHE_ATTRIBUTE_MASK)
+            .unwrap_or(patina::base::DEFAULT_CACHE_ATTR);
+        if GCD
+            .set_memory_space_attributes(image_base_page, patina::uefi_pages_to_size!(image_num_pages), stripped_attrs)
+            .is_err()
+        {
+            // if we failed to map this image RWX, we should still attempt to execute it, it may succeed
+            log::error!("Failed to set GCD attributes for image {}", filename);
+            debug_assert!(false);
+        }
+        Ok(())
+    }
+}
 
 pub fn init_gcd(physical_hob_list: *const c_void) {
     let mut free_memory_start: u64 = 0;
@@ -200,14 +457,8 @@ pub fn add_hob_resource_descriptors_to_gcd(hob_list: &HobList) {
         }
 
         if gcd_mem_type != GcdMemoryType::NonExistent {
-            // Extract cache attributes and add ReadProtect for system memory.
-            // Always set NX attribute for all memory regions. We will make the DXE Core code sections explicitly
-            // executable later. Any memory that needs to be executable must be explicitly set as such.
-            let mut memory_attributes = (cache_attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_XP;
-            if gcd_mem_type == GcdMemoryType::SystemMemory {
-                // Force all system memory to be RP by default (since none is allocated yet)
-                memory_attributes |= efi::MEMORY_RP;
-            }
+            let memory_attributes =
+                MemoryProtectionPolicy::apply_resc_desc_hobs_protection_policy(cache_attributes, gcd_mem_type);
 
             for split_range in
                 remove_range_overlap(&mem_range, &(free_memory_start..(free_memory_start + free_memory_size)))
@@ -269,68 +520,6 @@ fn remove_range_overlap<T: PartialOrd + Copy>(a: &Range<T>, b: &Range<T>) -> [Op
         // No overlap
         [Some(a.start..a.end), None]
     }
-}
-
-#[cfg(feature = "compatibility_mode_allowed")]
-/// This activates compatibility mode for the GCD.
-/// This will:
-/// - Activate compatibility mode for the GCD lower layers
-/// - Set the memory space attributes for all memory ranges in the loader code and data allocators to be RWX
-/// - Uninstall the memory attributes protocol
-pub(crate) fn activate_compatibility_mode() {
-    GCD.activate_compatibility_mode();
-    // if the allocator doesn't have any memory, then when it is used next it will allocate from the GCD
-    // and the GCD will be in compatibility mode, so we don't care here
-    let mut loader_mem_ranges = crate::allocator::get_memory_ranges_for_memory_type(efi::LOADER_CODE);
-    loader_mem_ranges.extend(crate::allocator::get_memory_ranges_for_memory_type(efi::LOADER_DATA));
-    for range in loader_mem_ranges.iter() {
-        let mut addr = range.start;
-        while addr < range.end {
-            let mut len = UEFI_PAGE_SIZE as u64;
-            match GCD.get_memory_descriptor_for_address(addr) {
-                Ok(descriptor) => {
-                    let attributes = descriptor.attributes & !efi::MEMORY_XP;
-                    len = match descriptor.base_address + descriptor.length {
-                        end if end > range.end => range.end - addr,
-                        _ => descriptor.length,
-                    };
-
-                    // We need to ensure we are operating on page aligned addresses and lengths, as the image(s) that
-                    // were allocated here may not be page aligned. We don't share pools across types, so this is safe.
-                    (addr, len) = match align_range(addr, len, UEFI_PAGE_SIZE as u64) {
-                        Ok((aligned_addr, aligned_len)) => (aligned_addr, aligned_len),
-                        Err(_) => {
-                            log::error!(
-                                "Failed to align address {addr:#x?} + {len:#x?} to page size, compatibility mode may fail",
-                            );
-                            debug_assert!(false);
-
-                            // If we can't align the address, we can't set the attributes, so try the next range
-                            addr += len;
-                            continue;
-                        }
-                    };
-
-                    if GCD.set_memory_space_attributes(addr as usize, len as usize, attributes).is_err() {
-                        log::error!(
-                            "Failed to set memory space attributes for range {addr:#x?} - {len:#x?}, compatibility mode may fail",
-                        );
-                        debug_assert!(false);
-                    }
-                }
-                _ => {
-                    log::error!(
-                        "Failed to get memory space descriptor for range {:#x?} - {:#x?}, compatibility mode may fail",
-                        range.start,
-                        range.end,
-                    );
-                    debug_assert!(false);
-                }
-            }
-            addr += len;
-        }
-    }
-    crate::memory_attributes_protocol::uninstall_memory_attributes_protocol();
 }
 
 /// Parse Resource Descriptor HOB v2
