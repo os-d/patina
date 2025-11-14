@@ -365,7 +365,7 @@ fn apply_image_memory_protections(pe_info: &UefiPeInfo, private_info: &PrivateIm
         // if we can't find this range in the GCD, try the next one, but report the failure
         let desc = dxe_services::core_get_memory_space_descriptor(section_base_addr)?;
         let (attributes, capabilities) =
-            MemoryProtectionPolicy::apply_image_protection_policy(section.characteristics, &desc)?;
+            MemoryProtectionPolicy::apply_image_protection_policy(section.characteristics, &desc);
 
         // now actually set the attributes. We need to use the virtual size for the section length, but
         // we cannot rely on this to be section aligned, as some compilers rely on the loader to align this
@@ -1430,6 +1430,8 @@ mod tests {
             init_system_table();
             init_test_image_support();
             f();
+            // we need the to drop the memory here while the GCD is still valid
+            PRIVATE_IMAGE_DATA.lock().reset();
         })
         .unwrap();
     }

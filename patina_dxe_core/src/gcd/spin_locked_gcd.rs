@@ -6,7 +6,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
-use crate::pecoff::{self, UefiPeInfo};
+use crate::pecoff::UefiPeInfo;
 use alloc::{boxed::Box, slice, vec, vec::Vec};
 use core::{fmt::Display, ptr};
 use patina::{base::DEFAULT_CACHE_ATTR, error::EfiError, pi::dxe_services::MemorySpaceDescriptor};
@@ -579,6 +579,42 @@ impl GCD {
         log::error!("GCD not allowed to allocate after EBS has started!");
         debug_assert!(false);
         Err(EfiError::AccessDenied)
+    }
+
+    // This function checks if allocated memory blocks exist for the entire specified address range.
+    // It returns Ok(()) only if every part of the range is covered by an Allocated block.
+    fn get_memory_block_allocation_state(&self, base_address: usize, len: usize) -> Result<(), EfiError> {
+        ensure!(self.maximum_address != 0, EfiError::NotReady);
+        ensure!(len > 0, EfiError::InvalidParameter);
+        ensure!(base_address + len <= self.maximum_address, EfiError::Unsupported);
+
+        let memory_blocks = &self.memory_blocks;
+
+        let mut current_base = base_address as u64;
+        let range_end = (base_address + len) as u64;
+
+        while current_base < range_end {
+            log::trace!(target: "gcd_measure", "search");
+            let idx = memory_blocks.get_closest_idx(&current_base).ok_or(EfiError::NotFound)?;
+            let block = memory_blocks.get_with_idx(idx).ok_or(EfiError::NotFound)?;
+
+            // Check that the block covers the current base
+            if current_base < block.start() as u64
+                || range_end > block.end() as u64 && block.end() as u64 <= current_base
+            {
+                return Err(EfiError::NotFound);
+            }
+
+            match block {
+                MemoryBlock::Unallocated(_) => return Err(EfiError::NotFound),
+                MemoryBlock::Allocated(_) => {}
+            }
+
+            // Advance to the end of this block or the end of the requested range
+            current_base = u64::min(block.end() as u64, range_end);
+        }
+
+        Ok(())
     }
 
     fn free_memory_space(
@@ -2065,7 +2101,7 @@ impl SpinLockedGcd {
             if let Err(err) = self.set_memory_space_attributes(
                 desc.base_address as usize,
                 desc.length as usize,
-                (desc.attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_XP,
+                GCD.memory_protection_policy.apply_allocated_memory_protection_policy(desc.attributes),
             ) {
                 // if we fail to set these attributes (which should just be XP at this point), we should try to
                 // continue
@@ -2097,9 +2133,9 @@ impl SpinLockedGcd {
             .expect("Failed to parse PE info for DXE Core")
         };
 
-        let dxe_core_cache_attr =
+        let dxe_core_desc =
             match self.get_memory_descriptor_for_address(dxe_core_hob.alloc_descriptor.memory_base_address) {
-                Ok(desc) => desc.attributes & efi::CACHE_ATTRIBUTE_MASK,
+                Ok(desc) => desc,
                 Err(e) => panic!("DXE Core not mapped in GCD {e:?}"),
             };
 
@@ -2107,12 +2143,12 @@ impl SpinLockedGcd {
         self.set_memory_space_attributes(
             dxe_core_hob.alloc_descriptor.memory_base_address as usize,
             dxe_core_hob.alloc_descriptor.memory_length as usize,
-            efi::MEMORY_XP | dxe_core_cache_attr,
+            GCD.memory_protection_policy.apply_allocated_memory_protection_policy(dxe_core_desc.attributes),
         )
         .unwrap_or_else(|_| {
             panic!(
-                "Failed to map DXE Core image {:#x?} of length {:#x?} with attributes {:#x?}.",
-                dxe_core_hob.alloc_descriptor.memory_base_address, 0x1000, 0
+                "Failed to map DXE Core image {:#x?} of length {:#x?}",
+                dxe_core_hob.alloc_descriptor.memory_base_address, dxe_core_hob.alloc_descriptor.memory_length
             )
         });
 
@@ -2121,10 +2157,8 @@ impl SpinLockedGcd {
             // each section starts at image_base + virtual_address, per PE/COFF spec.
             let section_base_address =
                 dxe_core_hob.alloc_descriptor.memory_base_address + (section.virtual_address as u64);
-            let mut attributes = efi::MEMORY_XP;
-            if section.characteristics & pecoff::IMAGE_SCN_CNT_CODE == pecoff::IMAGE_SCN_CNT_CODE {
-                attributes = efi::MEMORY_RO;
-            }
+            let (attributes, _) =
+                MemoryProtectionPolicy::apply_image_protection_policy(section.characteristics, &dxe_core_desc);
 
             // We need to use the virtual size for the section length, but
             // we cannot rely on this to be section aligned, as some compilers rely on the loader to align this
@@ -2143,17 +2177,13 @@ impl SpinLockedGcd {
                 "Mapping DXE Core image memory region {section_base_address:#x?} of length {aligned_virtual_size:#x?} with attributes {attributes:#x?}",
             );
 
-            attributes |=
-                match self.get_memory_descriptor_for_address(dxe_core_hob.alloc_descriptor.memory_base_address) {
-                    Ok(desc) => desc.attributes & efi::CACHE_ATTRIBUTE_MASK,
-                    Err(e) => panic!("DXE Core section not mapped in GCD {e:?}"),
-                };
-
             self.set_memory_space_attributes(section_base_address as usize, aligned_virtual_size as usize, attributes)
                 .unwrap_or_else(|_| {
                     panic!(
                         "Failed to map DXE Core image {:#x?} of length {:#x?} with attributes {:#x?}.",
-                        dxe_core_hob.alloc_descriptor.memory_base_address, 0x1000, 0
+                        dxe_core_hob.alloc_descriptor.memory_base_address,
+                        dxe_core_hob.alloc_descriptor.memory_length,
+                        attributes
                     )
                 });
         }
@@ -2164,7 +2194,7 @@ impl SpinLockedGcd {
             // table
             let base_address = desc.base_address as usize & !UEFI_PAGE_MASK;
             let len = (desc.length as usize + UEFI_PAGE_MASK) & !UEFI_PAGE_MASK;
-            let new_attributes = (desc.attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_XP;
+            let new_attributes = GCD.memory_protection_policy.apply_allocated_memory_protection_policy(desc.attributes);
 
             log::trace!(
                 target: "paging",
@@ -2194,7 +2224,11 @@ impl SpinLockedGcd {
         // only do this if page 0 actually exists
         if let Ok(descriptor) = self.get_memory_descriptor_for_address(0)
             && descriptor.memory_type != GcdMemoryType::NonExistent
-            && let Err(err) = self.set_memory_space_attributes(0, UEFI_PAGE_SIZE, efi::MEMORY_RP)
+            && let Err(err) = self.set_memory_space_attributes(
+                0,
+                UEFI_PAGE_SIZE,
+                MemoryProtectionPolicy::apply_null_page_policy(descriptor.attributes),
+            )
         {
             // if we fail to set these attributes we can continue to boot, but we will not be able to detect null
             // pointer dereferences.
@@ -2328,10 +2362,6 @@ impl SpinLockedGcd {
         result
     }
 
-    fn set_gcd_memory_attributes(&self, base_address: usize, len: usize, attributes: u64) -> Result<(), EfiError> {
-        self.memory.lock().set_gcd_memory_attributes(base_address, len, attributes)
-    }
-
     /// This service frees nonexistent memory, reserved memory, system memory, or memory-mapped I/O resources from the
     /// global coherency domain of the processor.
     ///
@@ -2361,6 +2391,10 @@ impl SpinLockedGcd {
         len: usize,
         transition: MemoryStateTransition,
     ) -> Result<(), EfiError> {
+        // check if this block is actually allocated by us and bail out if not, since we need to set the attributes
+        // to coalesce the memory blocks before attempting to free them
+        self.memory.lock().get_memory_block_allocation_state(base_address, len)?;
+
         // Set the attributes before freeing the memory space so that the memory blocks are merged together and we
         // can free the range. It is valid to call free pages on memory which has different attributes. If we fail the
         // free, the memory will be unmapped, but still marked allocated in the memory blocks. This is acceptable as it
@@ -2370,20 +2404,22 @@ impl SpinLockedGcd {
             base_address,
             len,
             |desc, base_address, len, _| {
+                // we call the worker here because we want to ensure we are getting the caching attribute from the
+                // correct descriptor. It is possible the caching attribute is different across descriptors.
                 if let Err(e) = self.set_memory_space_attributes_worker(
                     base_address,
                     len,
-                    efi::MEMORY_RP | efi::MEMORY_XP | (desc.attributes & efi::CACHE_ATTRIBUTE_MASK),
+                    MemoryProtectionPolicy::apply_free_memory_policy(desc.attributes),
                     desc.attributes,
-                )  && e != EfiError::NotReady {
+                ) && e != EfiError::NotReady
+                {
                     // if we failed to set the attributes in the GCD, we want to catch it, but should still try to go
                     // down and free the memory space. NotReady is ignored here because the memory bucket code will
                     // call this before paging is initialized.
                     log::error!(
-                        "Failed to set memory attributes for {:#x?} of length {:#x?} with attributes {:#x?}. Status: {:#x?}",
+                        "Failed to set free memory attributes for {:#x?} of length {:#x?} Status: {:#x?}",
                         base_address,
                         len,
-                        efi::MEMORY_RP,
                         e
                     );
                     debug_assert!(false);
@@ -2451,7 +2487,7 @@ impl SpinLockedGcd {
         // attributes per entry to ensure that we keep the GCD and page table in sync
         let attributes = MemoryProtectionPolicy::apply_nx_to_uc_policy(attributes);
 
-        match self.memory.lock().set_memory_space_attributes(base_address as usize, len as usize, attributes) {
+        match self.memory.lock().set_memory_space_attributes(base_address, len, attributes) {
             Ok(()) => {}
             Err(e) => {
                 log::error!(
@@ -2466,7 +2502,7 @@ impl SpinLockedGcd {
         // the page table and only the virtual attribute(s) are applied to the GCD, such as EFI_RUNTIME. In order
         // to maintain compatibility with existing drivers, we preserve this poor paradigm.
         if attributes & (efi::CACHE_ATTRIBUTE_MASK | efi::MEMORY_ACCESS_MASK) != 0 {
-            match self.set_paging_attributes(base_address as usize, len as usize, attributes) {
+            match self.set_paging_attributes(base_address, len, attributes) {
                 Ok(_) => {}
                 Err(EfiError::NotReady) => {
                     // before the page table is installed, we expect to get a return of NotReady. This means the GCD
@@ -2486,11 +2522,9 @@ impl SpinLockedGcd {
                     // to the previous attributes for this range. We may have partially updated this range in the GCD
                     // and the page table, but they will be in sync. We could attempt to continue here, but we need
                     // to return an error to the caller, so we might as well stop here.
-                    if let Err(rollback_err) = self.memory.lock().set_memory_space_attributes(
-                        base_address as usize,
-                        len as usize,
-                        original_attributes,
-                    ) {
+                    if let Err(rollback_err) =
+                        self.memory.lock().set_memory_space_attributes(base_address, len, original_attributes)
+                    {
                         // well, we did our best. The GCD and page table are now out of sync, which is a critical error.
                         log::error!(
                             "Failed to roll back GCD attributes after page table attribute set failure. This is a critical error. GCD and page table are now out of sync. Rollback error: {:?}",
@@ -3640,14 +3674,14 @@ mod tests {
     #[test]
     fn test_free_memory_space_before_memory_blocks_instantiated() {
         let mut gcd = GCD::new(48);
-        assert_eq!(Err(EfiError::NotFound), gcd.free_memory_space(0x1000, 0x1000));
+        assert_eq!(Err(EfiError::NotFound), gcd.free_memory_space(0x1000, 0x1000, MemoryStateTransition::Free));
     }
 
     #[test]
     fn test_free_memory_space_when_0_len_block() {
         let (mut gcd, _) = create_gcd();
         let snapshot = copy_memory_block(&gcd);
-        assert_eq!(Err(EfiError::InvalidParameter), gcd.free_memory_space(0, 0));
+        assert_eq!(Err(EfiError::InvalidParameter), gcd.free_memory_space(0, 0, MemoryStateTransition::Free));
         assert_eq!(snapshot, copy_memory_block(&gcd));
     }
 
@@ -3669,9 +3703,18 @@ mod tests {
 
         let snapshot = copy_memory_block(&gcd);
 
-        assert_eq!(Err(EfiError::Unsupported), gcd.free_memory_space(gcd.maximum_address, 10));
-        assert_eq!(Err(EfiError::Unsupported), gcd.free_memory_space(gcd.maximum_address - 99, 100));
-        assert_eq!(Err(EfiError::Unsupported), gcd.free_memory_space(gcd.maximum_address + 1, 100));
+        assert_eq!(
+            Err(EfiError::Unsupported),
+            gcd.free_memory_space(gcd.maximum_address, 10, MemoryStateTransition::Free)
+        );
+        assert_eq!(
+            Err(EfiError::Unsupported),
+            gcd.free_memory_space(gcd.maximum_address - 99, 100, MemoryStateTransition::Free)
+        );
+        assert_eq!(
+            Err(EfiError::Unsupported),
+            gcd.free_memory_space(gcd.maximum_address + 1, 100, MemoryStateTransition::Free)
+        );
 
         assert_eq!(snapshot, copy_memory_block(&gcd));
     }
@@ -3690,9 +3733,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(Err(EfiError::NotFound), gcd.free_memory_space(0x2000, 0x1000));
-        assert_eq!(Err(EfiError::NotFound), gcd.free_memory_space(0x4000, 0x1000));
-        assert_eq!(Err(EfiError::NotFound), gcd.free_memory_space(0, 0x1000));
+        assert_eq!(Err(EfiError::AccessDenied), gcd.free_memory_space(0x2000, 0x1000, MemoryStateTransition::Free));
+        assert_eq!(Err(EfiError::AccessDenied), gcd.free_memory_space(0x4000, 0x1000, MemoryStateTransition::Free));
+        assert_eq!(Err(EfiError::AccessDenied), gcd.free_memory_space(0, 0x1000, MemoryStateTransition::Free));
     }
 
     #[test]
@@ -3719,7 +3762,10 @@ mod tests {
             n += 1;
         }
         let memory_blocks_snapshot = copy_memory_block(&gcd);
-        assert_eq!(Err(EfiError::OutOfResources), gcd.free_memory_space(0x1000000, UEFI_PAGE_SIZE));
+        assert_eq!(
+            Err(EfiError::OutOfResources),
+            gcd.free_memory_space(0x1000000, UEFI_PAGE_SIZE, MemoryStateTransition::Free)
+        );
         assert_eq!(memory_blocks_snapshot, copy_memory_block(&gcd),);
     }
 
@@ -3739,15 +3785,27 @@ mod tests {
         .unwrap();
 
         let block_count = gcd.memory_descriptor_count();
-        assert_eq!(Ok(()), gcd.free_memory_space(0x1000, 0x1000), "Free beginning of a block.");
+        assert_eq!(
+            Ok(()),
+            gcd.free_memory_space(0x1000, 0x1000, MemoryStateTransition::Free),
+            "Free beginning of a block."
+        );
         assert_eq!(block_count + 1, gcd.memory_descriptor_count());
-        assert_eq!(Ok(()), gcd.free_memory_space(0x5000, 0x1000), "Free in the middle of a block");
+        assert_eq!(
+            Ok(()),
+            gcd.free_memory_space(0x5000, 0x1000, MemoryStateTransition::Free),
+            "Free in the middle of a block"
+        );
         assert_eq!(block_count + 3, gcd.memory_descriptor_count());
-        assert_eq!(Ok(()), gcd.free_memory_space(0x9000, 0x1000), "Free at the end of a block");
+        assert_eq!(
+            Ok(()),
+            gcd.free_memory_space(0x9000, 0x1000, MemoryStateTransition::Free),
+            "Free at the end of a block"
+        );
         assert_eq!(block_count + 5, gcd.memory_descriptor_count());
 
         let block_count = gcd.memory_descriptor_count();
-        assert_eq!(Ok(()), gcd.free_memory_space(0x2000, 0x2000));
+        assert_eq!(Ok(()), gcd.free_memory_space(0x2000, 0x2000, MemoryStateTransition::Free));
         assert_eq!(block_count, gcd.memory_descriptor_count());
 
         let blocks = copy_memory_block(&gcd);
@@ -3755,14 +3813,14 @@ mod tests {
         assert_eq!(0, mb.as_ref().base_address);
         assert_eq!(0x1000, mb.as_ref().length);
 
-        assert_eq!(Ok(()), gcd.free_memory_space(0x6000, 0x1000));
+        assert_eq!(Ok(()), gcd.free_memory_space(0x6000, 0x1000, MemoryStateTransition::Free));
         assert_eq!(block_count, gcd.memory_descriptor_count());
         let blocks = copy_memory_block(&gcd);
         let mb = blocks[2];
         assert_eq!(0x4000, mb.as_ref().base_address);
         assert_eq!(0x1000, mb.as_ref().length);
 
-        assert_eq!(Ok(()), gcd.free_memory_space(0x8000, 0x1000));
+        assert_eq!(Ok(()), gcd.free_memory_space(0x8000, 0x1000, MemoryStateTransition::Free));
         assert_eq!(block_count, gcd.memory_descriptor_count());
         let blocks = copy_memory_block(&gcd);
         let mb = blocks[4];
@@ -4505,8 +4563,8 @@ mod tests {
         assert_eq!(res.unwrap(), SIZE_4GB, "Failed to fall back to higher memory as expected");
 
         // Free the memory to check the next condition.
-        gcd.free_memory_space(SIZE_4GB - 0x10000, 0x10000).unwrap();
-        gcd.free_memory_space(SIZE_4GB, SIZE_4GB).unwrap();
+        gcd.free_memory_space(SIZE_4GB - 0x10000, 0x10000, MemoryStateTransition::Free).unwrap();
+        gcd.free_memory_space(SIZE_4GB, SIZE_4GB, MemoryStateTransition::Free).unwrap();
 
         // Check that a sufficiently large allocation will straddle the boundary.
         let res = gcd.allocate_memory_space(

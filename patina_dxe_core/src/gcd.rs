@@ -139,11 +139,11 @@ impl MemoryProtectionPolicy {
         attributes | efi::MEMORY_RP
     }
 
-    /// Rule: All loaded image sections must have memory protections applied based on the section type.
+    /// Rule: All loaded image sections must have memory protections applied based on the section type. The cache
+    /// attributes from the memory space descriptor are preserved.
     ///   - Code sections are marked as Read Only and Executable
     ///   - Data sections are marked as Read/Write and Non-Executable
     ///   - Sections w/o the write characteristic are marked as Read Only
-    /// The cache attributes from the memory space descriptor are preserved.
     ///
     /// Arguments
     /// * `section_base_addr` - The base address of the section being loaded
@@ -155,7 +155,7 @@ impl MemoryProtectionPolicy {
     pub(crate) fn apply_image_protection_policy(
         section_characteristics: u32,
         descriptor: &MemorySpaceDescriptor,
-    ) -> Result<(u64, u64), EfiError> {
+    ) -> (u64, u64) {
         let mut attributes = efi::MEMORY_XP;
         if section_characteristics & pecoff::IMAGE_SCN_CNT_CODE == pecoff::IMAGE_SCN_CNT_CODE {
             attributes = efi::MEMORY_RO;
@@ -171,7 +171,7 @@ impl MemoryProtectionPolicy {
 
         let capabilities = attributes | descriptor.capabilities;
 
-        Ok((attributes, capabilities))
+        (attributes, capabilities)
     }
 
     /// Rule: The EFI_MEMORY_MAP descriptor.attributes field is actually a capability field that must not have
@@ -222,6 +222,16 @@ impl MemoryProtectionPolicy {
     ///
     /// Use Case: This is called whenever memory is freed in the GCD
     pub(crate) fn apply_free_memory_policy(attributes: u64) -> u64 {
+        (attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_RP | efi::MEMORY_XP
+    }
+
+    /// Rule: Page 0 should be unmapped to catch null pointer dereferences. Cache attributes should be preserved.
+    ///
+    /// Arguments
+    /// - * `attributes` - The existing attributes for page 0
+    ///
+    /// Use Case: This is called when initializing paging to ensure page 0 is unmapped.
+    pub(crate) fn apply_null_page_policy(attributes: u64) -> u64 {
         (attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_RP | efi::MEMORY_XP
     }
 

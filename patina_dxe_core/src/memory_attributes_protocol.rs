@@ -111,7 +111,7 @@ extern "efiapi" fn set_memory_attributes(
     // failed, the system is dead, barring a bootloader allocating new memory and attempting to set attributes
     // there, because this API is only used by a bootloader setting memory attributes for the next image it is
     // loading. The expectation is that on a future boot the platform would disable this protocol.
-    .map_err(|_| return efi::Status::UNSUPPORTED);
+    .map_err(|_| efi::Status::UNSUPPORTED);
 
     efi::Status::SUCCESS
 }
@@ -153,7 +153,7 @@ extern "efiapi" fn clear_memory_attributes(
     // failed, the system is dead, barring a bootloader allocating new memory and attempting to set attributes
     // there, because this API is only used by a bootloader setting memory attributes for the next image it is
     // loading. The expectation is that on a future boot the platform would disable this protocol.
-    .map_err(|_| return efi::Status::UNSUPPORTED);
+    .map_err(|_| efi::Status::UNSUPPORTED);
 
     efi::Status::SUCCESS
 }
