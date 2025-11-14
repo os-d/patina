@@ -2378,7 +2378,7 @@ impl SpinLockedGcd {
         // free, the memory will be unmapped, but still marked allocated in the memory blocks. This is acceptable as it
         // will not be used again, we will return a failure to the caller and they can ignore this memory (which can
         // not be used after the failed free anyway).
-        self.do_operation_per_descriptor(
+        self.for_each_desc_in_range(
             base_address,
             len,
             |desc, base_address, len, _| {
@@ -2460,7 +2460,7 @@ impl SpinLockedGcd {
         result
     }
 
-    pub(crate) fn do_operation_per_descriptor<F>(
+    pub(crate) fn for_each_desc_in_range<F>(
         &self,
         base_address: usize,
         len: usize,
@@ -2506,7 +2506,7 @@ impl SpinLockedGcd {
         let attributes = MemoryProtectionPolicy::apply_nx_to_uc_policy(attributes);
 
         let mut res = Ok(());
-        self.do_operation_per_descriptor(
+        self.for_each_desc_in_range(
             base_address,
             len,
             |descriptor, current_base, current_len, attributes| {
