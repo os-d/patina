@@ -174,8 +174,67 @@ impl MemoryProtectionPolicy {
         Ok((attributes, capabilities))
     }
 
+    /// Rule: The EFI_MEMORY_MAP descriptor.attributes field is actually a capability field that must not have
+    /// access attributes in it; some OSes treat these as actually set attributes, not capabilities. The runtime
+    /// attribute is taken from the attributes, not the capabilities. Persistent memory must have EFI_MEMORY_NV set.
+    ///
+    /// Arguments
+    /// * `attributes` - The memory attributes from the EFI_MEMORY_MAP descriptor
+    /// * `capabilities` - The memory capabilities from the EFI_MEMORY_MAP descriptor
+    /// * `gcd_memory_type` - The GCD memory type for this region
+    ///
+    /// Use Case: This is called when building the EFI_MEMORY_MAP to ensure the attributes are correctly set.
+    pub(crate) fn apply_efi_memory_map_policy(
+        attributes: u64,
+        capabilities: u64,
+        gcd_memory_type: GcdMemoryType,
+    ) -> u64 {
+        let mut final_attributes =
+            capabilities & !(efi::MEMORY_ACCESS_MASK | efi::MEMORY_RUNTIME) | (attributes & efi::MEMORY_RUNTIME);
+
+        if gcd_memory_type == GcdMemoryType::Persistent {
+            final_attributes |= efi::MEMORY_NV;
+        }
+
+        final_attributes
+    }
+
+    /// Rule: All new memory should support all access capabilities and runtime. These are generally applicable, not
+    /// specific to any memory. All new memory is marked as EFI_MEMORY_RP to start with and will not be mapped until
+    /// SetMemorySpaceAttributes() is called to set the attributes.
+    ///
+    /// Arguments
+    /// - * `capabilities` - The existing capabilities for the memory region
+    ///
+    /// Returns the updated capabilities and the attributes to set
+    ///
+    /// Use Case: This is called whenever new memory is added to the GCD
+    pub(crate) fn apply_add_memory_policy(capabilities: u64) -> (u64, u64) {
+        (capabilities | efi::MEMORY_ACCESS_MASK | efi::MEMORY_RUNTIME, efi::MEMORY_RP)
+    }
+
+    /// Rule: All free memory should be marked as EFI_MEMORY_RP, EFI_MEMORY_XP, and the preserved cache attributes.
+    /// EFI_MEMORY_RP will cause the memory to be unmapped in the page table, but we still set EFI_MEMORY_XP to align
+    /// with the originally added memory so that free memory can be coalesced into fewer blocks.
+    ///
+    /// Arguments
+    /// - * `attributes` - The existing attributes for the memory region
+    ///
+    /// Use Case: This is called whenever memory is freed in the GCD
+    pub(crate) fn apply_free_memory_policy(attributes: u64) -> u64 {
+        (attributes & efi::CACHE_ATTRIBUTE_MASK) | efi::MEMORY_RP | efi::MEMORY_XP
+    }
+
     /// Rule: If the compatibility_mode_allowed feature flag is not set, we will fail to load
     /// the image that would crash the system with memory protections enabled
+    ///
+    /// Arguments
+    /// * `image_base_page` - The base page of the image being loaded
+    /// * `image_num_pages` - The number of pages in the image being loaded
+    /// * `filename` - The name of the image being loaded
+    ///
+    /// Use Case: This is called when the platform has not allowed compatibility mode and we are attempting to load
+    /// an EFI_APPLICATION that is not NX compatible.
     #[cfg(not(feature = "compatibility_mode_allowed"))]
     pub(crate) fn activate_compatibility_mode(
         _image_base_page: usize,
@@ -195,6 +254,14 @@ impl MemoryProtectionPolicy {
     /// - Activate compatibility mode for the GCD lower layers
     /// - Set the memory space attributes for all memory ranges in the loader code and data allocators to be RWX
     /// - Uninstall the memory attributes protocol
+    ///
+    /// Arguments
+    /// * `image_base_page` - The base page of the image being loaded
+    /// * `image_num_pages` - The number of pages in the image being loaded
+    /// * `filename` - The name of the image being loaded
+    ///
+    /// Use Case: This is called when the platform has allowed compatibility mode and we are attempting to load
+    /// an EFI_APPLICATION that is not NX compatible.
     #[cfg(feature = "compatibility_mode_allowed")]
     pub(crate) fn activate_compatibility_mode(
         image_base_page: usize,

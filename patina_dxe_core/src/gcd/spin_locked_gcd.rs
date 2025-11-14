@@ -334,20 +334,20 @@ impl GCD {
             memory_blocks: Rbt::new(),
             maximum_address: 1 << processor_address_bits,
             allocate_memory_space_fn: Self::allocate_memory_space_internal,
-            free_memory_space_fn: Self::free_memory_space_worker,
+            free_memory_space_fn: Self::free_memory_space,
             prioritize_32_bit_memory: false,
         }
     }
 
     pub fn lock_memory_space(&mut self) {
         self.allocate_memory_space_fn = Self::allocate_memory_space_null;
-        self.free_memory_space_fn = Self::free_memory_space_worker_null;
+        self.free_memory_space_fn = Self::free_memory_space_null;
         log::info!("Disallowing alloc/free during ExitBootServices.");
     }
 
     pub fn unlock_memory_space(&mut self) {
         self.allocate_memory_space_fn = Self::allocate_memory_space_internal;
-        self.free_memory_space_fn = Self::free_memory_space_worker;
+        self.free_memory_space_fn = Self::free_memory_space;
     }
 
     pub fn init(&mut self, processor_address_bits: u32) {
@@ -433,7 +433,7 @@ impl GCD {
         memory_type: dxe_services::GcdMemoryType,
         base_address: usize,
         len: usize,
-        mut capabilities: u64,
+        capabilities: u64,
     ) -> Result<usize, EfiError> {
         ensure!(self.maximum_address != 0, EfiError::NotReady);
         ensure!(len > 0, EfiError::InvalidParameter);
@@ -446,12 +446,7 @@ impl GCD {
         log::trace!(target: "allocations", "[{}]   Capabilities: {:#x}\n", function!(), capabilities);
 
         // All software capabilities are supported for system memory
-        capabilities |= efi::MEMORY_ACCESS_MASK | efi::MEMORY_RUNTIME;
-
-        // The MEMORY_MAPPED_IO_PORT_SPACE attribute should be supported for MMIO
-        if memory_type == dxe_services::GcdMemoryType::MemoryMappedIo {
-            capabilities |= efi::MEMORY_ISA_VALID;
-        }
+        let (capabilities, attributes) = MemoryProtectionPolicy::apply_add_memory_policy(capabilities);
 
         let memory_blocks = &mut self.memory_blocks;
 
@@ -467,7 +462,7 @@ impl GCD {
             idx,
             base_address,
             len,
-            MemoryStateTransition::Add(memory_type, capabilities, efi::MEMORY_RP),
+            MemoryStateTransition::Add(memory_type, capabilities, attributes),
         ) {
             Ok(idx) => Ok(idx),
             Err(InternalError::MemoryBlock(MemoryBlockError::BlockOutsideRange)) => error!(EfiError::AccessDenied),
@@ -586,7 +581,7 @@ impl GCD {
         Err(EfiError::AccessDenied)
     }
 
-    fn free_memory_space_worker(
+    fn free_memory_space(
         &mut self,
         base_address: usize,
         len: usize,
@@ -613,7 +608,7 @@ impl GCD {
     }
 
     #[coverage(off)]
-    fn free_memory_space_worker_null(
+    fn free_memory_space_null(
         _gcd: &mut GCD,
         _base_address: usize,
         _len: usize,
@@ -837,28 +832,6 @@ impl GCD {
             Err(InternalError::Slice(SliceError::OutOfSpace)) => error!(EfiError::OutOfResources),
             Err(e) => panic!("{e:?}"),
         }
-    }
-
-    /// This service frees nonexistent memory, reserved memory, system memory, or memory-mapped I/O resources from the
-    /// global coherency domain of the processor.
-    ///
-    /// # Documentation
-    /// UEFI Platform Initialization Specification, Release 1.8, Section II-7.2.4.3
-    pub fn free_memory_space(&mut self, base_address: usize, len: usize) -> Result<(), EfiError> {
-        (self.free_memory_space_fn)(self, base_address, len, MemoryStateTransition::Free)
-    }
-
-    /// This service frees nonexistent memory, reserved memory, system memory, or memory-mapped I/O resources from the
-    /// global coherency domain of the processor.
-    ///
-    /// Ownership of the memory as indicated by the image_handle associated with the block is retained, which means that
-    /// it cannot be re-allocated except by the original owner or by requests targeting a specific address within the
-    /// block (i.e. [`Self::allocate_memory_space`] with [`AllocateType::Address`]).
-    ///
-    /// # Documentation
-    /// UEFI Platform Initialization Specification, Release 1.8, Section II-7.2.4.3
-    pub fn free_memory_space_preserving_ownership(&mut self, base_address: usize, len: usize) -> Result<(), EfiError> {
-        (self.free_memory_space_fn)(self, base_address, len, MemoryStateTransition::FreePreservingOwnership)
     }
 
     /// This service sets attributes on the given memory space.
@@ -1788,7 +1761,7 @@ pub struct SpinLockedGcd {
     memory_type_info_table: [EFiMemoryTypeInformation; 17],
     page_table: tpl_lock::TplMutex<Option<Box<dyn PatinaPageTable>>>,
     /// Contains the current memory protection policy
-    memory_protection_policy: MemoryProtectionPolicy,
+    pub(crate) memory_protection_policy: MemoryProtectionPolicy,
 }
 
 impl SpinLockedGcd {
@@ -1809,7 +1782,7 @@ impl SpinLockedGcd {
                     maximum_address: 0,
                     memory_blocks: Rbt::new(),
                     allocate_memory_space_fn: GCD::allocate_memory_space_internal,
-                    free_memory_space_fn: GCD::free_memory_space_worker,
+                    free_memory_space_fn: GCD::free_memory_space,
                     prioritize_32_bit_memory: false,
                 },
                 "GcdMemLock",
@@ -1885,6 +1858,28 @@ impl SpinLockedGcd {
             let mut unmapped = false;
             let mut update_cache_attributes = true;
 
+            // EFI_MEMORY_RP is a special case, we don't actually want to set it in the page table, we want to unmap
+            // the region. It is valid for the region to already be unmapped or partially unmapped in this case. E.g.
+            // we might be freeing an entire image but the stack guard page is already unmapped.
+            if paging_attrs & MemoryAttributes::ReadProtect == MemoryAttributes::ReadProtect {
+                match page_table.unmap_memory_region(base_address as u64, len as u64) {
+                    Ok(_) => {
+                        log::trace!(
+                            target: "paging",
+                            "Memory region {base_address:#x?} of length {len:#x?} unmapped",
+                        );
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed to unmap memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
+                        );
+                        debug_assert!(false);
+                        return Err(EfiError::InvalidParameter);
+                    }
+                }
+            }
+
             // we assume that the page table and GCD are in sync. If not, we will debug_assert and return an error here
             // as this indicates a critical error
             let region_attributes = match page_table.query_memory_region(base_address as u64, len as u64) {
@@ -1938,35 +1933,6 @@ impl SpinLockedGcd {
                     "Memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. No paging action taken: Region already mapped with these attributes.",
                 );
                 return Ok(());
-            }
-
-            // EFI_MEMORY_RP is a special case, we don't actually want to set it in the page table, we want to unmap
-            // the region
-            if paging_attrs & MemoryAttributes::ReadProtect == MemoryAttributes::ReadProtect {
-                if unmapped {
-                    // the region is already unmapped, this indicates that the GCD and page table are out of sync
-                    log::error!(
-                        "Memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?} already unmapped. GCD and page table are out of sync. This is a critical error.",
-                    );
-                    debug_assert!(false);
-                    return Ok(());
-                }
-                match page_table.unmap_memory_region(base_address as u64, len as u64) {
-                    Ok(_) => {
-                        log::trace!(
-                            target: "paging",
-                            "Memory region {base_address:#x?} of length {len:#x?} unmapped",
-                        );
-                        return Ok(());
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to unmap memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
-                        );
-                        debug_assert!(false);
-                        return Err(EfiError::InvalidParameter);
-                    }
-                }
             }
 
             match page_table.map_memory_region(base_address as u64, len as u64, paging_attrs) {
@@ -2373,6 +2339,28 @@ impl SpinLockedGcd {
     /// UEFI Platform Initialization Specification, Release 1.8, Section II-7.2.4.3
     #[coverage(off)]
     pub fn free_memory_space(&self, base_address: usize, len: usize) -> Result<(), EfiError> {
+        self.free_memory_space_internal(base_address, len, MemoryStateTransition::Free)
+    }
+
+    /// This service frees nonexistent memory, reserved memory, system memory, or memory-mapped I/O resources from the
+    /// global coherency domain of the processor.
+    ///
+    /// Ownership of the memory as indicated by the image_handle associated with the block is retained, which means that
+    /// it cannot be re-allocated except by the original owner or by requests targeting a specific address within the
+    /// block (i.e. [`Self::allocate_memory_space`] with [`AllocateType::Address`]).
+    ///
+    /// # Documentation
+    /// UEFI Platform Initialization Specification, Release 1.8, Section II-7.2.4.3
+    pub fn free_memory_space_preserving_ownership(&self, base_address: usize, len: usize) -> Result<(), EfiError> {
+        self.free_memory_space_internal(base_address, len, MemoryStateTransition::FreePreservingOwnership)
+    }
+
+    fn free_memory_space_internal(
+        &self,
+        base_address: usize,
+        len: usize,
+        transition: MemoryStateTransition,
+    ) -> Result<(), EfiError> {
         // Set the attributes before freeing the memory space so that the memory blocks are merged together and we
         // can free the range. It is valid to call free pages on memory which has different attributes. If we fail the
         // free, the memory will be unmapped, but still marked allocated in the memory blocks. This is acceptable as it
@@ -2382,13 +2370,15 @@ impl SpinLockedGcd {
             base_address,
             len,
             |desc, base_address, len, _| {
-                if let Err(e) = GCD.set_gcd_memory_attributes(
+                if let Err(e) = self.set_memory_space_attributes_worker(
                     base_address,
                     len,
                     efi::MEMORY_RP | efi::MEMORY_XP | (desc.attributes & efi::CACHE_ATTRIBUTE_MASK),
-                ) {
+                    desc.attributes,
+                )  && e != EfiError::NotReady {
                     // if we failed to set the attributes in the GCD, we want to catch it, but should still try to go
-                    // down and free the memory space
+                    // down and free the memory space. NotReady is ignored here because the memory bucket code will
+                    // call this before paging is initialized.
                     log::error!(
                         "Failed to set memory attributes for {:#x?} of length {:#x?} with attributes {:#x?}. Status: {:#x?}",
                         base_address,
@@ -2404,60 +2394,17 @@ impl SpinLockedGcd {
             0,
         )?;
 
-        let mut result = self.memory.lock().free_memory_space(base_address, len);
-
-        match result {
-            Ok(_) => {
-                // when we free, we want to unmap this memory region and mark it EFI_MEMORY_RP in the GCD
-                // we don't panic if we don't have a page table because the memory bucket code does a free before the
-                // page table is initialized. If we were to end up without the page table initialized, we would still
-                // keep track of state in the GCD
-                if let Some(page_table) = &mut *self.page_table.lock() {
-                    match page_table.unmap_memory_region(base_address as u64, len as u64) {
-                        Ok(_) => {}
-                        Err(status) => {
-                            log::error!(
-                                "Failed to unmap memory region {base_address:#x?} of length {len:#x?}. Status: {status:#x?}",
-                            );
-                            debug_assert!(false);
-                            match status {
-                                PtError::OutOfResources => EfiError::OutOfResources,
-                                PtError::NoMapping => EfiError::NotFound,
-                                _ => EfiError::InvalidParameter,
-                            };
-                        }
-                    }
-                }
-
+        match self.memory.lock().free_memory_space(base_address, len, transition) {
+            Ok(()) => {
                 if let Some(callback) = self.memory_change_callback {
                     callback(MapChangeType::FreeMemorySpace);
                 }
+                Ok(())
             }
-            // this is the post-EBS case, we silently fail and return success
-            Err(EfiError::AccessDenied) => result = Ok(()),
-            _ => {}
+            // During EBS case, just ignore
+            Err(EfiError::AccessDenied) => Ok(()),
+            other => other,
         }
-
-        result
-    }
-
-    /// This service frees nonexistent memory, reserved memory, system memory, or memory-mapped I/O resources from the
-    /// global coherency domain of the processor.
-    ///
-    /// Ownership of the memory as indicated by the image_handle associated with the block is retained, which means that
-    /// it cannot be re-allocated except by the original owner or by requests targeting a specific address within the
-    /// block (i.e. [`Self::allocate_memory_space`] with [`AllocateType::Address`]).
-    ///
-    /// # Documentation
-    /// UEFI Platform Initialization Specification, Release 1.8, Section II-7.2.4.3
-    pub fn free_memory_space_preserving_ownership(&self, base_address: usize, len: usize) -> Result<(), EfiError> {
-        let result = self.memory.lock().free_memory_space_preserving_ownership(base_address, len);
-        if result.is_ok()
-            && let Some(callback) = self.memory_change_callback
-        {
-            callback(MapChangeType::FreeMemorySpace);
-        }
-        result
     }
 
     pub(crate) fn for_each_desc_in_range<F>(
@@ -2487,6 +2434,78 @@ impl SpinLockedGcd {
         Ok(())
     }
 
+    // This function is the per descriptor worker for set_memory_space_attributes. It assumes that the range being
+    // passed to it fits entirely within a single GCD descriptor. The wrapper functions of this must guarantee this or
+    // it will fail gracefully when splitting memory blocks.
+    fn set_memory_space_attributes_worker(
+        &self,
+        base_address: usize,
+        len: usize,
+        attributes: u64,
+        original_attributes: u64,
+    ) -> Result<(), EfiError> {
+        // this API allows for setting attributes across multiple descriptors in the GCD (assuming the capabilities
+        // allow it). The lower level set_memory_space_attributes will only operate on a single entry in the GCD/page
+        // table, so at this level we need to check to see if the range spans multiple entries and if so, we need to
+        // split the range and call set_memory_space_attributes for each entry. We also need to set the paging
+        // attributes per entry to ensure that we keep the GCD and page table in sync
+        let attributes = MemoryProtectionPolicy::apply_nx_to_uc_policy(attributes);
+
+        match self.memory.lock().set_memory_space_attributes(base_address as usize, len as usize, attributes) {
+            Ok(()) => {}
+            Err(e) => {
+                log::error!(
+                    "Failed to set GCD memory attributes for memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
+                );
+                debug_assert!(false);
+            }
+        }
+
+        // 0 is a valid value for paging attributes: it means RWX. 0 is invalid for cache attributes. edk2 has a
+        // behavior where if the caller passes 0 for cache and paging attributes, then 0 (RWX) is not applied to
+        // the page table and only the virtual attribute(s) are applied to the GCD, such as EFI_RUNTIME. In order
+        // to maintain compatibility with existing drivers, we preserve this poor paradigm.
+        if attributes & (efi::CACHE_ATTRIBUTE_MASK | efi::MEMORY_ACCESS_MASK) != 0 {
+            match self.set_paging_attributes(base_address as usize, len as usize, attributes) {
+                Ok(_) => {}
+                Err(EfiError::NotReady) => {
+                    // before the page table is installed, we expect to get a return of NotReady. This means the GCD
+                    // has been updated with the attributes, but the page table is not installed yet. In init_paging, the
+                    // page table will be updated with the current state of the GCD. The code that calls into this expects
+                    // NotReady to be returned, so we must catch that error and report it. However, we also need to
+                    // make sure any attribute updates across descriptors update the full range and not error out here.
+                    return Err(EfiError::NotReady);
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to set page table memory attributes for memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
+                    );
+                    debug_assert!(false);
+
+                    // if we failed here, we shouldn't leave the GCD and the page table out of sync. Roll the GCD back
+                    // to the previous attributes for this range. We may have partially updated this range in the GCD
+                    // and the page table, but they will be in sync. We could attempt to continue here, but we need
+                    // to return an error to the caller, so we might as well stop here.
+                    if let Err(rollback_err) = self.memory.lock().set_memory_space_attributes(
+                        base_address as usize,
+                        len as usize,
+                        original_attributes,
+                    ) {
+                        // well, we did our best. The GCD and page table are now out of sync, which is a critical error.
+                        log::error!(
+                            "Failed to roll back GCD attributes after page table attribute set failure. This is a critical error. GCD and page table are now out of sync. Rollback error: {:?}",
+                            rollback_err
+                        );
+                    }
+
+                    return Err(e);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// This service sets attributes on the given memory space.
     ///
     /// # Documentation
@@ -2497,76 +2516,26 @@ impl SpinLockedGcd {
         len: usize,
         attributes: u64,
     ) -> Result<(), EfiError> {
-        // this API allows for setting attributes across multiple descriptors in the GCD (assuming the capabilities
-        // allow it). The lower level set_memory_space_attributes will only operate on a single entry in the GCD/page
-        // table, so at this level we need to check to see if the range spans multiple entries and if so, we need to
-        // split the range and call set_memory_space_attributes for each entry. We also need to set the paging
-        // attributes per entry to ensure that we keep the GCD and page table in sync
-
-        let attributes = MemoryProtectionPolicy::apply_nx_to_uc_policy(attributes);
-
         let mut res = Ok(());
         self.for_each_desc_in_range(
             base_address,
             len,
             |descriptor, current_base, current_len, attributes| {
-            match self.memory.lock().set_memory_space_attributes(
-                current_base as usize,
-                current_len as usize,
-                attributes,
-            ) {
-                Ok(()) => {}
-                Err(e) => {
-                    log::error!(
-                        "Failed to set GCD memory attributes for memory region {current_base:#x?} of length {current_len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
-                    );
-                    debug_assert!(false);
-                }
-            }
-
-            // 0 is a valid value for paging attributes: it means RWX. 0 is invalid for cache attributes. edk2 has a
-            // behavior where if the caller passes 0 for cache and paging attributes, then 0 (RWX) is not applied to
-            // the page table and only the virtual attribute(s) are applied to the GCD, such as EFI_RUNTIME. In order
-            // to maintain compatibility with existing drivers, we preserve this poor paradigm.
-            if attributes & (efi::CACHE_ATTRIBUTE_MASK | efi::MEMORY_ACCESS_MASK) != 0 {
-                match self.set_paging_attributes(current_base as usize, current_len as usize, attributes) {
+                match self.set_memory_space_attributes_worker(
+                    current_base,
+                    current_len,
+                    attributes,
+                    descriptor.attributes,
+                ) {
                     Ok(_) => {}
-                    Err(EfiError::NotReady) => {
-                        // before the page table is installed, we expect to get a return of NotReady. This means the GCD
-                        // has been updated with the attributes, but the page table is not installed yet. In init_paging, the
-                        // page table will be updated with the current state of the GCD. The code that calls into this expects
-                        // NotReady to be returned, so we must catch that error and report it. However, we also need to
-                        // make sure any attribute updates across descriptors update the full range and not error out here.
-                        res = Err(EfiError::NotReady);
-                    }
                     Err(e) => {
-                        log::error!(
-                            "Failed to set page table memory attributes for memory region {current_base:#x?} of length {current_len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
-                        );
-                        debug_assert!(false);
-
-                        // if we failed here, we shouldn't leave the GCD and the page table out of sync. Roll the GCD back
-                        // to the previous attributes for this range. We may have partially updated this range in the GCD
-                        // and the page table, but they will be in sync. We could attempt to continue here, but we need
-                        // to return an error to the caller, so we might as well stop here.
-                        if let Err(rollback_err) = self.memory.lock().set_memory_space_attributes(
-                            current_base as usize,
-                            current_len as usize,
-                            descriptor.attributes,
-                        ) {
-                            // well, we did our best. The GCD and page table are now out of sync, which is a critical error.
-                            log::error!(
-                                "Failed to roll back GCD attributes after page table attribute set failure. This is a critical error. GCD and page table are now out of sync. Rollback error: {:?}",
-                                rollback_err
-                            );
-                        }
-
-                        return Err(e);
+                        res = Err(e);
                     }
                 }
-            }
-            Ok(())
-        }, attributes)?;
+                Ok(())
+            },
+            attributes,
+        )?;
 
         // if we made it out of the loop, we set the attributes correctly and should call the memory change callback,
         // if there is one
@@ -2663,12 +2632,12 @@ impl SpinLockedGcd {
 impl Display for SpinLockedGcd {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         if let Some(gcd) = self.memory.try_lock() {
-            writeln!(f, "{gcd}")?;
+            writeln!(f, "\n{gcd}")?;
         } else {
             writeln!(f, "Locked: {:?}", self.memory.try_lock())?;
         }
         if let Some(gcd) = self.io.try_lock() {
-            writeln!(f, "{gcd}")?;
+            writeln!(f, "\n{gcd}")?;
         } else {
             writeln!(f, "Locked: {:?}", self.io.try_lock())?;
         }
@@ -3809,7 +3778,7 @@ mod tests {
             memory_blocks: Rbt::new(),
             maximum_address: 0,
             allocate_memory_space_fn: GCD::allocate_memory_space_internal,
-            free_memory_space_fn: GCD::free_memory_space_worker,
+            free_memory_space_fn: GCD::free_memory_space,
             prioritize_32_bit_memory: false,
         };
         assert_eq!(Err(EfiError::NotReady), gcd.set_memory_space_attributes(0, 0x50000, 0b1111));
