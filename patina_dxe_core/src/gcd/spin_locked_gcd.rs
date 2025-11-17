@@ -2562,8 +2562,20 @@ impl SpinLockedGcd {
                     descriptor.attributes,
                 ) {
                     Ok(_) => {}
+                    Err(EfiError::NotReady) => {
+                        // before the page table is installed, we expect to get a return of NotReady. This means the GCD
+                        // has been updated with the attributes, but the page table is not installed yet. In init_paging, the
+                        // page table will be updated with the current state of the GCD. The code that calls into this expects
+                        // NotReady to be returned, so we must catch that error and report it. However, we also need to
+                        // make sure any attribute updates across descriptors update the full range and not error out here.
+                        res = Err(EfiError::NotReady);
+                    }
                     Err(e) => {
-                        res = Err(e);
+                        log::error!(
+                            "Failed to set memory attributes for memory region {current_base:#x?} of length {current_len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
+                        );
+                        debug_assert!(false);
+                        return Err(e);
                     }
                 }
                 Ok(())
@@ -5242,6 +5254,91 @@ mod tests {
                 current_mappings[0],
                 (overlapping_base as u64, overlapping_length as u64, MemoryAttributes::Uncacheable)
             );
+        });
+    }
+
+    #[test]
+    fn test_free_memory_space_across_descriptors() {
+        with_locked_state(|| {
+            static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+            GCD.init(48, 16);
+
+            let mem = unsafe { get_memory(MEMORY_BLOCK_SLICE_SIZE * 3) };
+            let address = align_up(mem.as_ptr() as usize, 0x1000).unwrap();
+
+            // SAFETY: We just allocated this memory to use in the test
+            unsafe {
+                GCD.init_memory_blocks(
+                    dxe_services::GcdMemoryType::SystemMemory,
+                    address,
+                    MEMORY_BLOCK_SLICE_SIZE,
+                    efi::MEMORY_WB,
+                )
+                .unwrap();
+
+                GCD.add_memory_space(GcdMemoryType::SystemMemory, 0x1000, 0x5000, efi::MEMORY_WB).unwrap();
+            }
+
+            // set a cache attribute for the range
+            let _ = GCD.set_memory_space_attributes(0x1000, 0x5000, efi::MEMORY_WB);
+
+            GCD.allocate_memory_space(
+                AllocateType::Address(0x1000),
+                GcdMemoryType::SystemMemory,
+                UEFI_PAGE_SHIFT,
+                0x5000,
+                0x7 as efi::Handle,
+                None,
+            )
+            .unwrap();
+
+            // w/o a page table set this will return NotReady, but that's fine for the purposes of this test,
+            // the GCD is still updated
+            let _ = GCD.set_memory_space_attributes(0x2000, 0x2000, efi::MEMORY_WB | efi::MEMORY_RO);
+
+            // Free memory space that spans all three descriptors
+            let result = GCD.free_memory_space(0x1000, 0x5000);
+            assert!(result.is_ok());
+        });
+    }
+
+    #[test]
+    fn test_set_memory_space_attributes_across_descriptors() {
+        with_locked_state(|| {
+            static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+            GCD.init(48, 16);
+
+            let mem = unsafe { get_memory(MEMORY_BLOCK_SLICE_SIZE * 3) };
+            let address = align_up(mem.as_ptr() as usize, 0x1000).unwrap();
+
+            // SAFETY: We just allocated this memory to use in the test
+            unsafe {
+                GCD.init_memory_blocks(
+                    dxe_services::GcdMemoryType::SystemMemory,
+                    address,
+                    MEMORY_BLOCK_SLICE_SIZE,
+                    efi::MEMORY_WB,
+                )
+                .unwrap();
+
+                GCD.add_memory_space(GcdMemoryType::SystemMemory, 0x1000, 0x5000, efi::MEMORY_WB).unwrap();
+            }
+
+            // bifurcate the range
+            GCD.allocate_memory_space(
+                AllocateType::Address(0x2000),
+                GcdMemoryType::SystemMemory,
+                UEFI_PAGE_SHIFT,
+                0x2000,
+                0x7 as efi::Handle,
+                None,
+            )
+            .unwrap();
+
+            // w/o a page table set this will return NotReady, but that's fine for the purposes of this test,
+            // the GCD is still updated, we would fail with NotFound if the GCD update fails
+            let res = GCD.set_memory_space_attributes(0x1000, 0x5000, efi::MEMORY_WB | efi::MEMORY_RO);
+            assert_eq!(res, Err(EfiError::NotReady));
         });
     }
 }

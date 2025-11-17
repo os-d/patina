@@ -13,7 +13,7 @@ mod spin_locked_gcd;
 use alloc::string::String;
 use goblin::pe::section_table;
 
-use core::{ffi::c_void, ops::Range};
+use core::{cell::Cell, ffi::c_void, ops::Range};
 use patina::{
     base::{align_down, align_up},
     error::EfiError,
@@ -42,13 +42,13 @@ pub use spin_locked_gcd::{AllocateType, MapChangeType, SpinLockedGcd};
 pub(crate) struct MemoryProtectionPolicy {
     /// The default attributes for memory allocations. This will be efi::MEMORY_XP unless
     /// we have entered compatibility mode, in which case it is 0, e.g. no protection
-    memory_allocation_default_attributes: u64,
+    memory_allocation_default_attributes: Cell<u64>,
 }
 
 impl MemoryProtectionPolicy {
     /// Create a new MemoryProtectionPolicy instance with default settings.
     pub(crate) const fn new() -> Self {
-        Self { memory_allocation_default_attributes: efi::MEMORY_XP }
+        Self { memory_allocation_default_attributes: Cell::new(efi::MEMORY_XP) }
     }
 
     /// Rule: All memory allocations will be marked as the set cache type with NX applied. If compatibility mode
@@ -60,7 +60,7 @@ impl MemoryProtectionPolicy {
     /// Use Case: This is called whenever memory is allocated via the GCD to ensure
     /// allocated memory is NX by default.
     pub(crate) fn apply_allocated_memory_protection_policy(&self, attributes: u64) -> u64 {
-        (attributes & efi::CACHE_ATTRIBUTE_MASK) | self.memory_allocation_default_attributes
+        (attributes & efi::CACHE_ATTRIBUTE_MASK) | self.memory_allocation_default_attributes.get()
     }
 
     /// Rule: All resource descriptor HOBs are initially mapped as the supplied cache attribute
@@ -247,6 +247,7 @@ impl MemoryProtectionPolicy {
     /// an EFI_APPLICATION that is not NX compatible.
     #[cfg(not(feature = "compatibility_mode_allowed"))]
     pub(crate) fn activate_compatibility_mode(
+        &self,
         _image_base_page: usize,
         _image_num_pages: usize,
         filename: String,
@@ -274,10 +275,14 @@ impl MemoryProtectionPolicy {
     /// an EFI_APPLICATION that is not NX compatible.
     #[cfg(feature = "compatibility_mode_allowed")]
     pub(crate) fn activate_compatibility_mode(
+        &self,
         image_base_page: usize,
         image_num_pages: usize,
         filename: String,
     ) -> Result<(), EfiError> {
+        // remove default NX protection
+        self.memory_allocation_default_attributes.set(0);
+
         const LEGACY_BIOS_WB_ADDRESS: usize = 0xA0000;
 
         log::warn!("Attempting to load an application image that is not NX compatible. Activating compatibility mode.");

@@ -27,6 +27,7 @@ use patina_internal_device_path::{DevicePathWalker, copy_device_path_to_boxed_sl
 use r_efi::efi;
 
 use crate::{
+    GCD,
     allocator::{core_allocate_pages, core_free_pages},
     config_tables::debug_image_info_table::{
         EfiDebugImageInfoNormal, core_new_debug_image_info_entry, core_remove_debug_image_info_entry,
@@ -597,9 +598,9 @@ fn core_load_pe_image(
             // we are trying to load an application image that is not NX compatible, likely a bootloader
             // if we are configured to allow compatibility mode, we need to activate it now. Otherwise, just continue
             // to load the image
-            MemoryProtectionPolicy::activate_compatibility_mode(
-                private_info.image_info.image_base as usize,
-                private_info.image_info.image_size as usize,
+            GCD.memory_protection_policy.activate_compatibility_mode(
+                private_info.image_base_page as usize,
+                private_info.image_num_pages as usize,
                 pe_info.filename.clone().unwrap_or(String::from("Unknown")),
             )?;
         }
