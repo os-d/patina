@@ -123,25 +123,26 @@ impl MemoryManager for CoreMemoryManager {
             None => None,
         };
 
-        GCD.for_each_desc_in_range(
-            address,
-            uefi_pages_to_size!(page_count),
-            |desc, base_address, len, _| {
-                // Always clear all access attributes and set the requested ones.
-                let mut new_attributes = desc.attributes & !efi::MEMORY_ACCESS_MASK;
-                new_attributes |= access_attributes;
+        let len = uefi_pages_to_size!(page_count);
+        let range_end = address.checked_add(len).ok_or(MemoryError::InvalidAddress)? as u64;
 
-                // If no cache attributes were requested, leave them unchanged.
-                if let Some(cache_attributes) = cache_attributes {
-                    new_attributes &= !efi::CACHE_ATTRIBUTE_MASK;
-                    new_attributes |= cache_attributes;
-                }
+        for desc in GCD.iter(address, len).map_err(|_| MemoryError::InternalError)? {
+            let current_base = desc.base_address as usize;
+            let current_len = desc.length_to_end_of_range(range_end) as usize;
 
-                dxe_services::core_set_memory_space_attributes(base_address as u64, len as u64, new_attributes)
-            },
-            access_attributes,
-        )
-        .map_err(|_| MemoryError::InternalError)?;
+            // Always clear all access attributes and set the requested ones.
+            let mut new_attributes = desc.attributes & !efi::MEMORY_ACCESS_MASK;
+            new_attributes |= access_attributes;
+
+            // If no cache attributes were requested, leave them unchanged.
+            if let Some(cache_attributes) = cache_attributes {
+                new_attributes &= !efi::CACHE_ATTRIBUTE_MASK;
+                new_attributes |= cache_attributes;
+            }
+
+            dxe_services::core_set_memory_space_attributes(current_base as u64, current_len as u64, new_attributes)
+                .map_err(|_| MemoryError::InternalError)?;
+        }
 
         Ok(())
     }

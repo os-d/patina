@@ -298,6 +298,21 @@ pub struct MemorySpaceDescriptor {
     pub device_handle: Handle,
 }
 
+impl MemorySpaceDescriptor {
+    /// Returns the length from the start of the descriptor to the end of the specified range or the length of the
+    /// descriptor if the range extends past the end of the descriptor.
+    ///
+    /// This is used when iterating over descriptors to determine how much of the descriptor falls within a given range.
+    pub fn length_to_end_of_range(&self, range_end: PhysicalAddress) -> u64 {
+        if self.base_address >= range_end {
+            0
+        } else {
+            let desc_end = self.base_address.saturating_add(self.length);
+            if desc_end >= range_end { range_end.saturating_sub(self.base_address) } else { self.length }
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 /// Global Coherency Domain (GCD) I/O space types

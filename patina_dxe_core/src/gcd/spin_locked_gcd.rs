@@ -2060,28 +2060,21 @@ impl SpinLockedGcd {
         self.io.lock().init(io_address_bits);
     }
 
-    /// Helper function to perform an operation on each GCD descriptor in the given range.
+    /// Returns an iterator over GCD descriptors in the given range.
     ///
     /// Arguments:
     /// - `base_address`: The starting address of the range.
     /// - `len`: The length of the range.
-    /// - `operation`: The operation to perform on each descriptor. It takes the descriptor, the base address of the current range,
-    ///   the length of the current range, and a context value.
-    /// - `context`: A context value to pass to the operation.
     ///
     /// Returns:
-    /// - `Ok(())` if the operation was successful for all descriptors.
-    /// - `Err(EfiError)` if the operation failed for any descriptor. The operation does not continue if a failure occurs.
-    pub(crate) fn for_each_desc_in_range<F>(
+    /// - An iterator that yields `MemorySpaceDescriptor`s.
+    pub(crate) fn iter(
         &self,
         base_address: usize,
         len: usize,
-        mut operation: F,
-        context: u64,
-    ) -> Result<(), EfiError>
-    where
-        F: FnMut(MemorySpaceDescriptor, usize, usize, u64) -> Result<(), EfiError>,
-    {
+    ) -> Result<impl Iterator<Item = MemorySpaceDescriptor>, EfiError> {
+        let mut descs = Vec::new();
+
         let mut current_base = base_address as u64;
         let range_end = (base_address + len) as u64;
         while current_base < range_end {
@@ -2090,13 +2083,12 @@ impl SpinLockedGcd {
 
             // it is still legal to split a descriptor and only operate on part of it
             let next_base = u64::min(descriptor_end, range_end);
-            let current_len = next_base - current_base;
-            operation(descriptor, current_base as usize, current_len as usize, context)?;
+            descs.push(descriptor);
 
             current_base = next_base;
         }
 
-        Ok(())
+        Ok(descs.into_iter())
     }
 
     // Take control of our own destiny and create a page table that the GCD controls
@@ -2413,40 +2405,38 @@ impl SpinLockedGcd {
         // to coalesce the memory blocks before attempting to free them
         self.memory.lock().get_memory_block_allocation_state(base_address, len)?;
 
+        let range_end = base_address.checked_add(len).ok_or(EfiError::InvalidParameter)? as u64;
+
         // Set the attributes before freeing the memory space so that the memory blocks are merged together and we
         // can free the range. It is valid to call free pages on memory which has different attributes. If we fail the
         // free, the memory will be unmapped, but still marked allocated in the memory blocks. This is acceptable as it
         // will not be used again, we will return a failure to the caller and they can ignore this memory (which can
         // not be used after the failed free anyway).
-        self.for_each_desc_in_range(
-            base_address,
-            len,
-            |desc, base_address, len, _| {
-                // we call the worker here because we want to ensure we are getting the caching attribute from the
-                // correct descriptor. It is possible the caching attribute is different across descriptors.
-                if let Err(e) = self.set_memory_space_attributes_worker(
-                    base_address,
-                    len,
-                    MemoryProtectionPolicy::apply_free_memory_policy(desc.attributes),
-                    desc.attributes,
-                ) && e != EfiError::NotReady
-                {
-                    // if we failed to set the attributes in the GCD, we want to catch it, but should still try to go
-                    // down and free the memory space. NotReady is ignored here because the memory bucket code will
-                    // call this before paging is initialized.
-                    log::error!(
-                        "Failed to set free memory attributes for {:#x?} of length {:#x?} Status: {:#x?}",
-                        base_address,
-                        len,
-                        e
-                    );
-                    debug_assert!(false);
-                    return Err(e);
-                }
-                Ok(())
-            },
-            0,
-        )?;
+        for desc in self.iter(base_address, len)? {
+            let current_base = desc.base_address as usize;
+            let current_len = desc.length_to_end_of_range(range_end) as usize;
+            // we call the worker here because we want to ensure we are getting the caching attribute from the
+            // correct descriptor. It is possible the caching attribute is different across descriptors.
+            if let Err(e) = self.set_memory_space_attributes_worker(
+                current_base,
+                current_len,
+                MemoryProtectionPolicy::apply_free_memory_policy(desc.attributes),
+                desc.attributes,
+            ) && e != EfiError::NotReady
+            {
+                // if we failed to set the attributes in the GCD, we want to catch it, but should still try to go
+                // down and free the memory space. NotReady is ignored here because the memory bucket code will
+                // call this before paging is initialized.
+                log::error!(
+                    "Failed to set free memory attributes for {:#x?} of length {:#x?} Status: {:#x?}",
+                    current_base,
+                    current_len,
+                    e
+                );
+                debug_assert!(false);
+                return Err(e);
+            }
+        }
 
         match self.memory.lock().free_memory_space(base_address, len, transition) {
             Ok(()) => {
@@ -2566,37 +2556,31 @@ impl SpinLockedGcd {
         attributes: u64,
     ) -> Result<(), EfiError> {
         let mut res = Ok(());
-        self.for_each_desc_in_range(
-            base_address,
-            len,
-            |descriptor, current_base, current_len, attributes| {
-                match self.set_memory_space_attributes_worker(
-                    current_base,
-                    current_len,
-                    attributes,
-                    descriptor.attributes,
-                ) {
-                    Ok(_) => {}
-                    Err(EfiError::NotReady) => {
-                        // before the page table is installed, we expect to get a return of NotReady. This means the GCD
-                        // has been updated with the attributes, but the page table is not installed yet. In init_paging, the
-                        // page table will be updated with the current state of the GCD. The code that calls into this expects
-                        // NotReady to be returned, so we must catch that error and report it. However, we also need to
-                        // make sure any attribute updates across descriptors update the full range and not error out here.
-                        res = Err(EfiError::NotReady);
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "Failed to set memory attributes for memory region {current_base:#x?} of length {current_len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
-                        );
-                        debug_assert!(false);
-                        return Err(e);
-                    }
+        let range_end = base_address.checked_add(len).ok_or(EfiError::InvalidParameter)? as u64;
+
+        for desc in self.iter(base_address, len)? {
+            let current_base = desc.base_address as usize;
+            let current_len = desc.length_to_end_of_range(range_end) as usize;
+
+            match self.set_memory_space_attributes_worker(current_base, current_len, attributes, desc.attributes) {
+                Ok(_) => {}
+                Err(EfiError::NotReady) => {
+                    // before the page table is installed, we expect to get a return of NotReady. This means the GCD
+                    // has been updated with the attributes, but the page table is not installed yet. In init_paging, the
+                    // page table will be updated with the current state of the GCD. The code that calls into this expects
+                    // NotReady to be returned, so we must catch that error and report it. However, we also need to
+                    // make sure any attribute updates across descriptors update the full range and not error out here.
+                    res = Err(EfiError::NotReady);
                 }
-                Ok(())
-            },
-            attributes,
-        )?;
+                Err(e) => {
+                    log::error!(
+                        "Failed to set memory attributes for memory region {current_base:#x?} of length {current_len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",
+                    );
+                    debug_assert!(false);
+                    return Err(e);
+                }
+            }
+        }
 
         // if we made it out of the loop, we set the attributes correctly and should call the memory change callback,
         // if there is one
