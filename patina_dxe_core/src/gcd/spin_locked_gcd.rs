@@ -2710,6 +2710,10 @@ impl SpinLockedGcd {
         let mut res = Ok(());
         let range = base_address as u64..base_address.checked_add(len).ok_or(EfiError::InvalidParameter)? as u64;
 
+        if base_address == 0x10000000000 {
+            patina_debugger::breakpoint();
+        }
+
         for desc_result in self.iter(base_address, len) {
             let desc = desc_result?;
             let current_range = desc.get_range_overlap_with_desc(&range);
