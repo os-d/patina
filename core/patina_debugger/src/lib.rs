@@ -228,7 +228,11 @@ pub fn initialize(interrupt_manager: &mut dyn InterruptManager, timer: Option<&'
 /// routine will have no effect.
 pub fn breakpoint() {
     if enabled() {
-        breakpoint_unchecked();
+        if initialized() {
+            breakpoint_unchecked();
+        } else {
+            log::error!("Debugger breakpoint invoked before debugger initialized, not breaking in!");
+        }
     }
 }
 
@@ -267,6 +271,14 @@ pub fn poll_debugger() {
 pub fn enabled() -> bool {
     match DEBUGGER.get() {
         Some(debugger) => debugger.enabled(),
+        None => false,
+    }
+}
+
+/// Checks if the debugger is initialized.
+pub fn initialized() -> bool {
+    match DEBUGGER.get() {
+        Some(debugger) => debugger.initialized(),
         None => false,
     }
 }
