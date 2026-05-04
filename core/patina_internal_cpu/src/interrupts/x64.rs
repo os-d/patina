@@ -90,12 +90,12 @@ pub fn disable_interrupts() {
 }
 
 #[allow(unused)]
-pub fn get_interrupt_state() -> Result<bool, EfiError> {
+pub fn get_interrupt_state() -> bool {
     let eflags: u64;
     const IF: u64 = 0x200;
     // SAFETY: The ASM below simply reads the interrupt flag to determine state, it is a safe operation
     unsafe {
         asm!("pushfq; pop {}", out(reg)eflags);
     }
-    Ok(eflags & IF != 0)
+    eflags & IF != 0
 }

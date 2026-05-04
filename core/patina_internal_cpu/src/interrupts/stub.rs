@@ -36,10 +36,10 @@ pub fn enable_interrupts() {}
 #[allow(unused)]
 pub fn disable_interrupts() {}
 
-/// A function that always returns `false` as this is a null implementation.
+/// A function that always returns `true` as this is a null implementation.
 #[allow(unused)]
-pub fn get_interrupt_state() -> Result<bool, EfiError> {
-    Ok(false)
+pub fn get_interrupt_state() -> bool {
+    true
 }
 
 /// Null Implementation of the InterruptManager.

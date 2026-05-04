@@ -128,15 +128,13 @@ extern "efiapi" fn get_interrupt_state(this: *const Protocol, state: *mut bool) 
     if state.is_null() {
         return efi::Status::INVALID_PARAMETER;
     }
-    interrupts::get_interrupt_state()
-        .map(|interrupt_state| {
-            // SAFETY: caller must ensure that state is a valid pointer. It is null-checked above.
-            unsafe {
-                state.write_unaligned(interrupt_state);
-            }
-            efi::Status::SUCCESS
-        })
-        .unwrap_or_else(|err| err.into())
+    let interrupt_state = interrupts::get_interrupt_state();
+
+    // SAFETY: caller must ensure that state is a valid pointer. It is null-checked above.
+    unsafe {
+        state.write_unaligned(interrupt_state);
+    }
+    efi::Status::SUCCESS
 }
 
 extern "efiapi" fn init(this: *const Protocol, init_type: CpuInitType) -> efi::Status {

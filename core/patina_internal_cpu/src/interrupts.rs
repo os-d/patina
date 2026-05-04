@@ -50,8 +50,8 @@ cfg_if::cfg_if! {
 
         /// Gets the current state of CPU interrupts.
         #[coverage(off)]
-        pub fn get_interrupt_state() -> Result<bool, EfiError> {
-            Ok(false)
+        pub fn get_interrupt_state() -> bool {
+            false
         }
 
     } else if #[cfg(target_arch = "x86_64")] {
