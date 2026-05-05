@@ -64,6 +64,7 @@
 #![feature(c_variadic)]
 #![feature(allocator_api)]
 #![feature(coverage_attribute)]
+#![feature(int_lowest_highest_one)]
 
 extern crate alloc;
 

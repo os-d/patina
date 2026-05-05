@@ -6,6 +6,7 @@
 //!
 //! SPDX-License-Identifier: Apache-2.0
 //!
+//!
 use core::{
     ffi::c_void,
     sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -214,6 +215,8 @@ pub extern "efiapi" fn set_timer(event: efi::Event, timer_type: efi::TimerDelay,
     }
 }
 
+static INTERRUPT_TPL_MASK: AtomicUsize = AtomicUsize::new(0);
+
 pub extern "efiapi" fn raise_tpl(new_tpl: efi::Tpl) -> efi::Tpl {
     if new_tpl > efi::TPL_HIGH_LEVEL {
         panic!("Invalid attempt to raise TPL above TPL_HIGH_LEVEL: {new_tpl:#x?}");
@@ -225,11 +228,34 @@ pub extern "efiapi" fn raise_tpl(new_tpl: efi::Tpl) -> efi::Tpl {
         panic!("Invalid attempt to raise TPL to lower value. New TPL: {new_tpl:#x?}, Prev TPL: {prev_tpl:#x?}");
     }
 
+    // interrupts are currently enabled so disable them if we are at TPL_HIGH_LEVEL
     if (new_tpl == efi::TPL_HIGH_LEVEL) && (prev_tpl < efi::TPL_HIGH_LEVEL) {
-        interrupts::disable_interrupts();
+        let interrupt_state = interrupts::get_interrupt_state();
+        if interrupt_state {
+            // interrupts are currently enabled so disable them if we are at TPL_HIGH_LEVEL
+            interrupts::disable_interrupts();
+        } else {
+            // interrupts are disabled, meaning we must be in an interrupt handler. We will save off the TPL
+            // that was interrupted so that when we restore the TPL, we can keep interrupts disabled in the
+            // interrupt handler.
+            INTERRUPT_TPL_MASK.fetch_or(1 << prev_tpl, Ordering::SeqCst);
+            unsafe {
+                if core::ptr::read_volatile(&TMP) == 1 {
+                    TMP2.store(true, Ordering::SeqCst);
+                }
+            }
+        }
     }
+
     prev_tpl
 }
+
+#[used]
+static TMP: usize = 0;
+#[used]
+static TMP2: AtomicBool = AtomicBool::new(false);
+
+static EVENT_NOTIFIES_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
     let prev_tpl = CURRENT_TPL.fetch_min(new_tpl, Ordering::SeqCst);
@@ -248,7 +274,6 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
             // call restore_tpl. To avoid infinite recursion, this logic uses EVENT_NOTIFIES_IN_PROGRESS as a flag to
             // avoid reentrancy in the specific case that the lock is being taken for the purpose of acquiring event
             // notifies.
-            static EVENT_NOTIFIES_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
             let event =
                 match EVENT_NOTIFIES_IN_PROGRESS.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) {
                     Ok(_) => {
@@ -256,42 +281,80 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
                         EVENT_NOTIFIES_IN_PROGRESS.store(false, Ordering::Release);
                         result
                     }
-                    _ => break, /* reentrant restore_tpl case */
+                    _ => {
+                        break;
+                    } /* reentrant restore_tpl case */
                 };
 
             let Some(event) = event else {
                 break; /* no pending events */
             };
-            if event.notify_tpl < efi::TPL_HIGH_LEVEL {
-                interrupts::enable_interrupts();
-            } else {
-                interrupts::disable_interrupts();
-            }
+
             CURRENT_TPL.store(event.notify_tpl, Ordering::SeqCst);
+            if event.notify_tpl < efi::TPL_HIGH_LEVEL {
+                // If lowering below TPL_HIGH_LEVEL, re-enable interrupts to avoid priority inversion. The
+                // TPL here is higher than the caller's TPL, so we are limited in the number of nested interrupts
+                // that can happen
+                interrupts::enable_interrupts();
+            }
+
             let notify_context = event.notify_context.unwrap_or(core::ptr::null_mut());
 
             if EVENT_DB.get_event_type(event.event).unwrap().is_notify_signal() {
                 let _ = EVENT_DB.clear_signal(event.event);
             }
 
-            //Caution: this is calling function pointer supplied by code outside DXE Rust.
-            //The notify_function is not "unsafe" per the signature, even though it's
-            //supplied by code outside the core module. If it were marked 'unsafe'
-            //then other Rust modules executing under DXE Rust would need to mark all event
-            //callbacks as "unsafe", and the r_efi definition for EventNotify would need to
-            //change.
+            // Caution: this is calling a function pointer supplied by code outside Patina.
+            // The notify_function is not "unsafe" per the signature, even though it's
+            // supplied by code outside the core module. If it were marked 'unsafe'
+            // then other Rust modules executing under Patina would need to mark all event
+            // callbacks as "unsafe", and the r_efi definition for EventNotify would need to
+            // change.
             if let Some(notify_function) = event.notify_function {
                 (notify_function)(event.event, notify_context);
             }
         }
     }
 
+    // We disable interrupts while interrupt handlers run, so the interrupt handler raises TPL to TPL_HIGH_LEVEL
+    // while it runs to maintain consistency. However, when the interrupt handler then calls restore_tpl after
+    // executing we want to keep interrupts disabled so we do not overflow the stack if we took too long in
+    // the handler and got an interrupt while still processing interrupts. The handler is then responsible for
+    // restoring interrupts. Ensure we disable interrupts before changing the CURRENT_TPL so that if we get
+    // a nested interrupt it will have a TPL higher than this and will bound the stack depth.
+    interrupts::disable_interrupts();
     CURRENT_TPL.store(new_tpl, Ordering::SeqCst);
 
-    if new_tpl < efi::TPL_HIGH_LEVEL {
+    // worked in repro
+    if EVENT_NOTIFIES_IN_PROGRESS.load(Ordering::SeqCst) {
+        return;
+    }
+
+    if new_tpl <= INTERRUPT_TPL_MASK.load(Ordering::SeqCst).highest_one().unwrap_or(0) as usize {
+        // we are returning from an interrupt handler so leave interrupts disabled.
+        debug_assert!(
+            interrupts::get_interrupt_state() == false,
+            "Interrupts should be disabled when returning from an interrupt handler"
+        );
+        unsafe {
+            if new_tpl == 0x4 && TMP2.load(Ordering::SeqCst) {
+                while core::ptr::read_volatile(&DUMMY) == 0 {}
+            }
+        }
+        INTERRUPT_TPL_MASK.fetch_and((1 << new_tpl) - 1, Ordering::SeqCst);
+    } else if new_tpl < efi::TPL_HIGH_LEVEL {
+        // we are not returning to an interrupt handler, so make sure interrupts are enabled
+        unsafe {
+            if new_tpl == 0x4 && TMP2.load(Ordering::SeqCst) {
+                while core::ptr::read_volatile(&DUMMY) == 0 {}
+            }
+        }
         interrupts::enable_interrupts();
     }
 }
+
+#[used]
+static DUMMY: usize = 0;
 
 extern "efiapi" fn timer_tick(time: u64) {
     let old_tpl = raise_tpl(efi::TPL_HIGH_LEVEL);
