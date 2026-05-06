@@ -282,6 +282,7 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
                         result
                     }
                     _ => {
+                        // EVENT_NOTIFIES_IN_PROGRESS.store(false, Ordering::Release);
                         break;
                     } /* reentrant restore_tpl case */
                 };
@@ -290,18 +291,21 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
                 break; /* no pending events */
             };
 
-            CURRENT_TPL.store(event.notify_tpl, Ordering::SeqCst);
-            if event.notify_tpl < efi::TPL_HIGH_LEVEL {
-                // If lowering below TPL_HIGH_LEVEL, re-enable interrupts to avoid priority inversion. The
-                // TPL here is higher than the caller's TPL, so we are limited in the number of nested interrupts
-                // that can happen
-                interrupts::enable_interrupts();
-            }
-
             let notify_context = event.notify_context.unwrap_or(core::ptr::null_mut());
 
             if EVENT_DB.get_event_type(event.event).unwrap().is_notify_signal() {
                 let _ = EVENT_DB.clear_signal(event.event);
+            }
+
+            CURRENT_TPL.store(event.notify_tpl, Ordering::SeqCst);
+            if event.notify_tpl < efi::TPL_HIGH_LEVEL {
+                // If lowering below TPL_HIGH_LEVEL, re-enable interrupts to avoid priority inversion. The
+                // TPL here is higher than the caller's TPL, so we are limited in the number of nested interrupts
+                // that can happen. This must come directly before the call to the notify function to
+                // ensure that the notify function is called with interrupts enabled if the TPL demands it. We
+                // cannot do TPL manipulations before calling the notify function after this point because we will
+                // have disabled the interrupts in the recursive call and not restored them.
+                interrupts::enable_interrupts();
             }
 
             // Caution: this is calling a function pointer supplied by code outside Patina.
@@ -327,6 +331,11 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
 
     // worked in repro
     if EVENT_NOTIFIES_IN_PROGRESS.load(Ordering::SeqCst) {
+        if new_tpl < efi::TPL_HIGH_LEVEL
+            && new_tpl > INTERRUPT_TPL_MASK.load(Ordering::SeqCst).highest_one().unwrap_or(0) as usize
+        {
+            interrupts::enable_interrupts();
+        }
         return;
     }
 
