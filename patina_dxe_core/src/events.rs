@@ -329,15 +329,12 @@ pub extern "efiapi" fn restore_tpl(new_tpl: efi::Tpl) {
     interrupts::disable_interrupts();
     CURRENT_TPL.store(new_tpl, Ordering::SeqCst);
 
-    // If we are in a recursive restore_tpl call, we don't want to clear the INTERRUPT_TPL_MASK because that needs to
-    // happen at the outer layer to determine whether interrupts should be disabled or enabled. We do need to enable
-    // interrupts
     if EVENT_NOTIFIES_IN_PROGRESS.load(Ordering::SeqCst) {
-        // if new_tpl < efi::TPL_HIGH_LEVEL
-        //     && new_tpl > INTERRUPT_TPL_MASK.load(Ordering::SeqCst).highest_one().unwrap_or(0) as usize
-        // {
-        //     interrupts::enable_interrupts();
-        // }
+        // If we are in a recursive restore_tpl call, we don't want to clear the INTERRUPT_TPL_MASK because that
+        // needs to happen at the outer layer to determine whether interrupts should be disabled or enabled.
+        // We also don't want to blindly enable interrupts here because we don't want to enable interrupts for the
+        // outer layer. Simply return here and let the outer layer handle the interrupt state. We've already enabled
+        // interrupts when processing event notifications (if required).
         return;
     }
 
