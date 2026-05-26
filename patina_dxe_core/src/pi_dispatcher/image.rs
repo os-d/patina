@@ -1239,12 +1239,12 @@ fn core_load_pe_image(
     let size = pe_info.size_of_image as usize;
 
     // the section alignment must be at least the size of a page
-    if !alignment.is_multiple_of(UEFI_PAGE_SIZE) {
-        log::error!(
-            "core_load_pe_image failed: {pe_file_name} section alignment of {alignment:#x?} is not a multiple of page size {UEFI_PAGE_SIZE:#x?}"
-        );
-        return Err(EfiError::LoadError);
-    }
+    // if !alignment.is_multiple_of(UEFI_PAGE_SIZE) {
+    //     log::error!(
+    //         "core_load_pe_image failed: {pe_file_name} section alignment of {alignment:#x?} is not a multiple of page size {UEFI_PAGE_SIZE:#x?}"
+    //     );
+    //     return Err(EfiError::LoadError);
+    // }
 
     // the size of the image must be a multiple of the section alignment per PE/COFF spec
     if !size.is_multiple_of(alignment) {
@@ -1270,7 +1270,9 @@ fn core_load_pe_image(
     // If we are not NX compatible and a EFI Application, we need to attempt to activate compatibility mode.
     // Compatability mode may or may not actually activate depending on how we are configured.
     // Otherwise apply the memory protections.
-    if private_info.pe_info.image_type == EFI_IMAGE_SUBSYSTEM_EFI_APPLICATION && !private_info.pe_info.nx_compat {
+    if (private_info.pe_info.image_type == EFI_IMAGE_SUBSYSTEM_EFI_APPLICATION && !private_info.pe_info.nx_compat)
+        || !alignment.is_multiple_of(UEFI_PAGE_SIZE)
+    {
         private_info.activate_compatibility_mode()?;
     } else {
         // finally, update the GCD attributes for this image so that code sections have RO set and data sections
