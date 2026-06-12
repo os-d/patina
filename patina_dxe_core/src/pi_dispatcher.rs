@@ -25,7 +25,11 @@ use mu_rust_helpers::guid::guid_fmt;
 use patina::{
     device_path::walker::concat_device_path_to_boxed_slice,
     error::EfiError,
-    pi::{fw_fs::ffs, hob::HobList, protocols::firmware_volume_block},
+    pi::{
+        fw_fs::ffs,
+        hob::{Hob, HobList},
+        protocols::firmware_volume_block,
+    },
 };
 use patina_ffs::{
     section::{Section, SectionExtractor},
@@ -145,7 +149,7 @@ impl<P: PlatformInfo> PiDispatcher<P> {
                 efi::EVT_NOTIFY_SIGNAL,
                 efi::TPL_CALLBACK,
                 Some(Self::fw_vol_event_protocol_notify_efiapi),
-                None,
+                Some(hob_list as *const _ as *mut c_void),
                 None,
             )
             .expect("Failed to create fv protocol installation callback.");
@@ -211,7 +215,6 @@ impl<P: PlatformInfo> PiDispatcher<P> {
     }
 
     /// Installs any firmware volumes from FV HOBs in the hob list
-    #[inline(always)]
     #[coverage(off)]
     pub fn install_firmware_volumes_from_hoblist(
         &self,
@@ -486,8 +489,8 @@ impl<P: PlatformInfo> PiDispatcher<P> {
 
     #[inline(always)]
     #[coverage(off)]
-    fn add_fv_handles(&self, new_handles: Vec<efi::Handle>) -> Result<(), EfiError> {
-        self.dispatcher_context.lock().add_fv_handles(new_handles, &self.section_extractor)
+    fn add_fv_handles(&self, new_handles: Vec<efi::Handle>, hob_list: &HobList) -> Result<(), EfiError> {
+        self.dispatcher_context.lock().add_fv_handles(new_handles, &self.section_extractor, hob_list)
     }
 
     #[inline(always)]
@@ -503,11 +506,15 @@ impl<P: PlatformInfo> PiDispatcher<P> {
     }
 
     /// EFIAPI event callback to add the FV handles when FVB protocol is installed.
-    extern "efiapi" fn fw_vol_event_protocol_notify_efiapi(_event: efi::Event, _context: *mut c_void) {
+    extern "efiapi" fn fw_vol_event_protocol_notify_efiapi(_event: efi::Event, context: *mut c_void) {
         let pd = &crate::Core::<P>::instance().pi_dispatcher;
+        // SAFETY: The event was created with a valid pointer to the HobList.
+        let hob_list = unsafe { &*(context as *const HobList) };
         //Note: runs at TPL_CALLBACK
         match PROTOCOL_DB.locate_handles(Some(firmware_volume_block::PROTOCOL_GUID.into_inner())) {
-            Ok(fv_handles) => pd.add_fv_handles(fv_handles).expect("Error adding FV handles"),
+            Ok(fv_handles) => {
+                pd.add_fv_handles(fv_handles, hob_list).expect("Error adding FV handles");
+            }
             Err(_) => panic!("could not locate handles in protocol call back"),
         };
     }
@@ -608,6 +615,7 @@ impl DispatcherContext {
         &mut self,
         new_handles: Vec<efi::Handle>,
         extractor: &impl SectionExtractor,
+        hob_list: &HobList,
     ) -> Result<(), EfiError> {
         for handle in new_handles {
             if self.processed_fvs.insert(handle) {
@@ -658,6 +666,7 @@ impl DispatcherContext {
                         continue;
                     }
                 };
+                let fv_name = fv.fv_name();
 
                 for file in fv.files() {
                     let file = file?;
@@ -759,6 +768,29 @@ impl DispatcherContext {
                     if file.file_type_raw() == ffs::file::raw::r#type::FIRMWARE_VOLUME_IMAGE {
                         let file = file.clone();
                         let file_name = file.name().into_inner();
+                        use patina::BinaryGuid;
+
+                        // if we have an FV2 or extracted FV3 HOB for this FV, it has already been decompressed and we
+                        // don't need to do it again
+                        if let Some(_) = hob_list.iter().find(|hob| match hob {
+                            Hob::FirmwareVolume2(fv2) => {
+                                log::error!("Found FV2 HOB for file FV {}", fv2.fv_name);
+                                fv2.file_name == file_name
+                                    && fv2.fv_name
+                                        == fv_name
+                                            .unwrap_or(BinaryGuid::from_string("00000000-0000-0000-0000-000000000000"))
+                            }
+                            Hob::FirmwareVolume3(fv3) if fv3.extracted_fv.into() => {
+                                fv3.file_name == file_name
+                                    && fv3.fv_name
+                                        == fv_name
+                                            .unwrap_or(BinaryGuid::from_string("00000000-0000-0000-0000-000000000000"))
+                            }
+                            _ => false,
+                        }) {
+                            log::error!("OSDDEBUG300 Found existing FV HOB for file");
+                            continue;
+                        }
 
                         let sections = file.sections_with_extractor(extractor)?;
 
