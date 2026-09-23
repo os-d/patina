@@ -67,7 +67,16 @@ normal case after the allocators have run for a while and have built up a set of
 Freeing a block (except for very large blocks) is also constant-time, since the procedure is the reverse of the above:
 
 1. Round up the freed allocation size to the next block size.
-2. Push the block on the front of the corresponding "free-list."
+2. Push the block on the back of the corresponding "free-list."
+
+Freed blocks are appended to the back of the free list rather than the front so that a block is not immediately handed
+back out. Recycling blocks in first-in-first-out order maximizes the time between a block being freed and it being
+reused, which increases the chance that a use-after-free accesses memory that has not yet been handed to another owner.
+
+When every byte of a page has been returned to the free lists, the page holds no live data. The allocator removes the
+free blocks in that page from its free lists and marks the page `EFI_MEMORY_RP`, which unmaps it, so that any access to
+memory that was freed from that page faults. Retired pages are re-mapped and returned to the backing allocator when the
+allocator would otherwise have to claim more memory from the GCD.
 
 If the fixed-block size list corresponding to the requested block size is empty or if the requested size is larger than
 any fixed-block size, then the allocation falls back to a linked-list based allocator. This is also typically constant-
