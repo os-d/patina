@@ -78,6 +78,11 @@ free blocks in that page from its free lists and marks the page `EFI_MEMORY_RP`,
 memory that was freed from that page faults. Retired pages are re-mapped and returned to the backing allocator when the
 allocator would otherwise have to claim more memory from the GCD.
 
+Memory claimed from the GCD starts in that same retired state, so an allocator never has memory mapped that it has not
+handed out. Pages are mapped in batches as the allocator needs them, which keeps the number of page table updates (and
+the cache attribute change events they produce) proportional to the memory actually in use rather than to the size of
+the region claimed from the GCD.
+
 If the fixed-block size list corresponding to the requested block size is empty or if the requested size is larger than
 any fixed-block size, then the allocation falls back to a linked-list based allocator. This is also typically constant-
 time, since the first block in the linked-list backing allocator is larger than all the free-list block sizes (because

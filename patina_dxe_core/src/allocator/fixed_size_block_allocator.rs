@@ -68,6 +68,12 @@ const fn block_footprint(block_size: usize) -> usize {
     if block_size > MIN_HEAP_FOOTPRINT { block_size } else { MIN_HEAP_FOOTPRINT }
 }
 
+/// The number of retired pages mapped back in at a time.
+///
+/// Memory owned by this allocator is kept unmapped until it is needed, so mapping is done in batches to keep the
+/// number of page table updates (and the cache attribute change events they produce) down.
+const RECLAIM_BATCH_PAGES: usize = 16;
+
 // Returns the index in the block list for the minimum size block that will
 // satisfy allocation for the given layout
 fn list_index(layout: &Layout) -> Option<usize> {
@@ -79,18 +85,17 @@ struct BlockListNode {
     next: Option<NonNull<BlockListNode>>,
 }
 
-/// Per-page accounting for a single page of memory owned by this allocator.
-#[derive(Clone, Copy)]
-struct PageMeta {
-    /// The number of bytes of this page that are currently sitting on the fixed-size block free lists.
-    ///
-    /// When this reaches [`UEFI_PAGE_SIZE`] every byte of the page has been handed out as a fixed-size block and
-    /// subsequently freed, so the page holds no live data and can be retired.
-    free_bytes: u16,
+/// The number of bytes of a page that are on the free lists once every byte of the page is free.
+///
+/// A page in this state holds no live data, so it has been taken out of the free lists and unmapped. It has to be
+/// mapped and given back to the backing allocator before it can be used again.
+const RETIRED_PAGE: u16 = UEFI_PAGE_SIZE as u16;
 
-    /// Set while the page is retired: removed from the free lists and unmapped in the page table.
-    retired: bool,
-}
+/// Marks a page that has been taken out of the free lists but has not been unmapped yet, so that it is not brought
+/// back into service while the unmap is still in flight.
+const RETIRING_PAGE: u16 = u16::MAX;
+
+const _: () = assert!(UEFI_PAGE_SIZE < RETIRING_PAGE as usize);
 
 struct AllocatorListNode {
     next: Option<*mut AllocatorListNode>,
@@ -99,26 +104,31 @@ struct AllocatorListNode {
     /// The base of the region this node was created from, including this node and the page metadata.
     region_base: usize,
 
-    /// The base address of the first whole page of the region that `page_meta` describes.
+    /// The base address of the first whole page of the region that `page_free_bytes` describes.
     page_base: usize,
 
-    /// Per-page accounting for the whole pages contained in this region. Stored in the region itself so that the
-    /// allocator never has to allocate in order to track its own memory.
-    page_meta: &'static mut [PageMeta],
+    /// The number of bytes of each whole page in this region that are currently sitting on the fixed-size block free
+    /// lists, along with the [`RETIRED_PAGE`] and [`RETIRING_PAGE`] states.
+    ///
+    /// This is stored in the region itself so that the allocator never has to allocate in order to track its own
+    /// memory. It lives in the region header rather than in the pages it describes so that it stays readable while
+    /// those pages are retired; the header is never handed out by the backing allocator, so the pages holding it are
+    /// never retired.
+    page_free_bytes: &'static mut [u16],
 }
 
 impl AllocatorListNode {
-    /// Returns the index into `page_meta` of the tracked page containing `address`, if any.
+    /// Returns the index into `page_free_bytes` of the tracked page containing `address`, if any.
     fn page_index(&self, address: usize) -> Option<usize> {
         let index = address.checked_sub(self.page_base)? >> UEFI_PAGE_SHIFT;
-        (index < self.page_meta.len()).then_some(index)
+        (index < self.page_free_bytes.len()).then_some(index)
     }
 
-    /// Returns the base address of the tracked page containing `address` along with its metadata.
-    fn page_meta_mut(&mut self, address: usize) -> Option<(usize, &mut PageMeta)> {
+    /// Returns the base address of the tracked page containing `address` along with its free byte count.
+    fn page_free_bytes_mut(&mut self, address: usize) -> Option<(usize, &mut u16)> {
         let index = self.page_index(address)?;
         let page_base = self.page_base + (index << UEFI_PAGE_SHIFT);
-        Some((page_base, self.page_meta.get_mut(index)?))
+        Some((page_base, self.page_free_bytes.get_mut(index)?))
     }
 }
 
@@ -141,7 +151,7 @@ impl RegionHeader {
         let page_count = align_down_size(region_end, UEFI_PAGE_SIZE).saturating_sub(page_base) >> UEFI_PAGE_SHIFT;
 
         let (layout, meta_offset) =
-            Layout::new::<AllocatorListNode>().extend(Layout::array::<PageMeta>(page_count).ok()?).ok()?;
+            Layout::new::<AllocatorListNode>().extend(Layout::array::<u16>(page_count).ok()?).ok()?;
 
         Some(Self { size: layout.pad_to_align().size(), meta_offset, page_base, page_count })
     }
@@ -238,11 +248,18 @@ impl FixedSizeBlockAllocator {
     /// node to manage this range. The region is consumed by an `AllocatorListNode` and the per-page tracking metadata
     /// for the region; the remainder is available to the allocator.
     ///
+    /// Every whole page of the new region starts retired, so the allocator does not have any memory mapped that it
+    /// has not handed out yet. The returned range is the memory the caller must unmap, or must hand to
+    /// [`Self::restore_pages`] if it cannot be unmapped.
+    ///
     /// ## Errors
     ///
     /// Returns [`FixedSizeBlockAllocatorError::InvalidExpansion`] if the new region is not larger than and aligned to
     /// `AllocatorListNode`.
-    pub fn expand(&mut self, new_region: NonNull<[u8]>) -> core::result::Result<(), FixedSizeBlockAllocatorError> {
+    pub fn expand(
+        &mut self,
+        new_region: NonNull<[u8]>,
+    ) -> core::result::Result<Option<Range<usize>>, FixedSizeBlockAllocatorError> {
         // Interpret the first part of the provided region as an AllocatorListNode
         let alloc_node_ptr = new_region.as_ptr().cast::<AllocatorListNode>();
 
@@ -263,11 +280,11 @@ impl FixedSizeBlockAllocator {
         }
 
         // SAFETY: the header lies within the region, which was validated to be large enough above, and meta_offset is
-        // aligned for PageMeta by Layout::extend.
-        let page_meta = unsafe {
-            let meta_ptr = new_region.as_ptr().cast::<u8>().add(header.meta_offset).cast::<PageMeta>();
+        // aligned for the page metadata by Layout::extend.
+        let page_free_bytes = unsafe {
+            let meta_ptr = new_region.as_ptr().cast::<u8>().add(header.meta_offset).cast::<u16>();
             for index in 0..header.page_count {
-                meta_ptr.add(index).write(PageMeta { free_bytes: 0, retired: false });
+                meta_ptr.add(index).write(0);
             }
             core::slice::from_raw_parts_mut(meta_ptr, header.page_count)
         };
@@ -286,7 +303,7 @@ impl FixedSizeBlockAllocator {
             allocator: linked_list_allocator::Heap::empty(),
             region_base,
             page_base: header.page_base,
-            page_meta,
+            page_free_bytes,
         };
         // SAFETY: alloc_node_ptr is aligned and points to valid writable memory for an AllocatorListNode.
         unsafe {
@@ -303,7 +320,37 @@ impl FixedSizeBlockAllocator {
             self.stats.claimed_pages += uefi_size_to_pages!(new_region.len());
         }
 
-        Ok(())
+        Ok(self.retire_new_region(alloc_node_ptr))
+    }
+
+    /// Takes every whole page of a newly expanded region out of its backing allocator and marks it retired, so that
+    /// the pages are not handed out until they have been mapped.
+    ///
+    /// Returns the range covered by those pages.
+    fn retire_new_region(&mut self, node: *mut AllocatorListNode) -> Option<Range<usize>> {
+        // SAFETY: node was just written by expand() and its heap has been initialized.
+        let (heap_start, heap_end) = unsafe { ((*node).allocator.bottom() as usize, (*node).allocator.top() as usize) };
+
+        let pages = align_up_size(heap_start, UEFI_PAGE_SIZE)..align_down_size(heap_end, UEFI_PAGE_SIZE);
+        if pages.is_empty() {
+            return None;
+        }
+
+        let layout = Layout::from_size_align(pages.len(), UEFI_PAGE_SIZE).ok()?;
+
+        // SAFETY: node is valid and its heap covers all of the whole pages in the region.
+        unsafe {
+            (*node).allocator.allocate_first_fit(layout).ok()?;
+            for page_base in pages.clone().step_by(UEFI_PAGE_SIZE) {
+                if let Some((_, free_bytes)) = (*node).page_free_bytes_mut(page_base) {
+                    *free_bytes = RETIRING_PAGE;
+                }
+            }
+        }
+
+        self.stats.retired_pages += pages.len() >> UEFI_PAGE_SHIFT;
+
+        Some(pages)
     }
 
     // allocates from the linked-list backing allocator if a free block of the
@@ -328,7 +375,7 @@ impl FixedSizeBlockAllocator {
 
         // Account for the per-page metadata that `expand()` reserves at the front of the new region.
         let additional_mem_required =
-            additional_mem_required + size_of::<PageMeta>() * (uefi_size_to_pages!(additional_mem_required) + 1);
+            additional_mem_required + size_of::<u16>() * (uefi_size_to_pages!(additional_mem_required) + 1);
         let additional_mem_required = align_up_size(additional_mem_required, align_of::<AllocatorListNode>());
 
         Err(FixedSizeBlockAllocatorError::OutOfMemory(additional_mem_required))
@@ -447,8 +494,8 @@ impl FixedSizeBlockAllocator {
         let Some(node) = self.node_for_address(address) else { return };
         // SAFETY: node_for_address returned a valid node that tracks the page containing `address`.
         unsafe {
-            if let Some((_, meta)) = (*node).page_meta_mut(address) {
-                meta.free_bytes = meta.free_bytes.saturating_sub(footprint as u16);
+            if let Some((_, free_bytes)) = (*node).page_free_bytes_mut(address) {
+                *free_bytes = free_bytes.saturating_sub(footprint as u16);
             }
         }
     }
@@ -459,13 +506,20 @@ impl FixedSizeBlockAllocator {
         let node = self.node_for_address(address)?;
 
         // SAFETY: node_for_address returned a valid node that tracks the page containing `address`.
-        let (page_base, page_is_free) = unsafe {
-            let (page_base, meta) = (*node).page_meta_mut(address)?;
-            meta.free_bytes = meta.free_bytes.saturating_add(footprint as u16);
-            (page_base, usize::from(meta.free_bytes) >= UEFI_PAGE_SIZE)
+        let (page_base, page_free_bytes) = unsafe {
+            let (page_base, free_bytes) = (*node).page_free_bytes_mut(address)?;
+
+            // A page that is out of circulation has no blocks on the free lists, so this is a double free.
+            if *free_bytes >= RETIRED_PAGE {
+                debug_assert!(false, "FSB freed a block belonging to a page that is not in circulation.");
+                return None;
+            }
+
+            *free_bytes = free_bytes.saturating_add(footprint as u16);
+            (page_base, *free_bytes)
         };
 
-        if !page_is_free {
+        if page_free_bytes < RETIRED_PAGE {
             return None;
         }
 
@@ -475,9 +529,8 @@ impl FixedSizeBlockAllocator {
 
         // SAFETY: node remains valid and tracks page_base.
         unsafe {
-            let (_, meta) = (*node).page_meta_mut(page_base)?;
-            meta.free_bytes = 0;
-            meta.retired = true;
+            let (_, free_bytes) = (*node).page_free_bytes_mut(page_base)?;
+            *free_bytes = RETIRING_PAGE;
         }
         self.stats.retired_pages += 1;
 
@@ -520,24 +573,55 @@ impl FixedSizeBlockAllocator {
         }
     }
 
-    /// Returns the base address of a retired page, if the allocator has one.
+    /// Returns the address range of up to `count` contiguous retired pages, if the allocator has any.
     ///
-    /// The page remains retired until it is handed to [`Self::restore_page`].
-    fn find_retired_page(&self) -> Option<usize> {
+    /// The pages remain retired until they are handed to [`Self::restore_pages`].
+    fn find_retired_pages(&self, count: usize) -> Option<Range<usize>> {
         AllocatorIterator::new(self.allocators).find_map(|node| {
             // SAFETY: node is produced by AllocatorIterator and points to a valid AllocatorListNode.
             let node = unsafe { &*node };
-            let index = node.page_meta.iter().position(|meta| meta.retired)?;
-            Some(node.page_base + (index << UEFI_PAGE_SHIFT))
+            let first = node.page_free_bytes.iter().position(|free_bytes| *free_bytes == RETIRED_PAGE)?;
+            let run = node
+                .page_free_bytes
+                .get(first..)?
+                .iter()
+                .take(count)
+                .take_while(|free_bytes| **free_bytes == RETIRED_PAGE)
+                .count();
+            Some(node.page_base + (first << UEFI_PAGE_SHIFT)..node.page_base + ((first + run) << UEFI_PAGE_SHIFT))
         })
+    }
+
+    /// Marks pages that have been unmapped as retired, making them available to be mapped back in and reused.
+    pub(crate) fn mark_pages_retired(&mut self, pages: Range<usize>) {
+        for page_base in pages.step_by(UEFI_PAGE_SIZE) {
+            let Some(node) = self.node_for_address(page_base) else {
+                debug_assert!(false, "FSB asked to retire a page it does not own.");
+                continue;
+            };
+            // SAFETY: node_for_address returned a valid node that tracks page_base.
+            unsafe {
+                if let Some((_, free_bytes)) = (*node).page_free_bytes_mut(page_base) {
+                    *free_bytes = RETIRED_PAGE;
+                }
+            }
+        }
+    }
+
+    /// Returns a range of retired pages to the backing allocators that own them, making them available for allocation
+    /// again.
+    ///
+    /// The caller must ensure the pages are mapped before calling this.
+    pub(crate) fn restore_pages(&mut self, pages: Range<usize>) {
+        for page_base in pages.step_by(UEFI_PAGE_SIZE) {
+            self.restore_page(page_base);
+        }
     }
 
     /// Returns a retired page to the backing allocator that owns it, making it available for allocation again.
     ///
-    /// ## Safety
-    ///
     /// The caller must ensure the page is mapped before calling this.
-    pub(crate) fn restore_page(&mut self, page_base: usize) {
+    fn restore_page(&mut self, page_base: usize) {
         let Some(node) = self.node_for_address(page_base) else {
             debug_assert!(false, "FSB asked to restore a page it does not own.");
             return;
@@ -553,9 +637,8 @@ impl FixedSizeBlockAllocator {
         // have been freed and unlinked, so returning the page as a single allocation describes exactly the memory the
         // heap considers in use.
         unsafe {
-            if let Some((_, meta)) = (*node).page_meta_mut(page_base) {
-                meta.free_bytes = 0;
-                meta.retired = false;
+            if let Some((_, free_bytes)) = (*node).page_free_bytes_mut(page_base) {
+                *free_bytes = 0;
             }
             (*node).allocator.deallocate(ptr, layout);
         }
@@ -739,19 +822,19 @@ impl SpinLockedFixedSizeBlockAllocator {
         self.inner.lock()
     }
 
-    /// Updates the attributes of a single pool page through the GCD, preserving the attributes that are not being
+    /// Updates the attributes of a range of pool pages through the GCD, preserving the attributes that are not being
     /// changed.
     ///
     /// Note: the FSB lock must not be held when calling this, as the GCD allocates and frees pool memory.
-    fn update_page_attributes<F>(&self, page_base: usize, update: F) -> Result<(), EfiError>
+    fn update_page_attributes<F>(&self, pages: &Range<usize>, update: F) -> Result<(), EfiError>
     where
         F: FnOnce(u64) -> u64,
     {
-        let descriptor = self.gcd.get_memory_descriptor_for_address(page_base as efi::PhysicalAddress, |d, _| {
+        let descriptor = self.gcd.get_memory_descriptor_for_address(pages.start as efi::PhysicalAddress, |d, _| {
             d.memory_type != GcdMemoryType::NonExistent
         })?;
 
-        match self.gcd.set_memory_space_attributes(page_base, UEFI_PAGE_SIZE, update(descriptor.attributes)) {
+        match self.gcd.set_memory_space_attributes(pages.start, pages.len(), update(descriptor.attributes)) {
             // NotReady means the page table is not installed yet; the GCD has been updated and the page table will
             // pick the attributes up when paging is initialized.
             Ok(()) | Err(EfiError::NotReady) => Ok(()),
@@ -759,43 +842,46 @@ impl SpinLockedFixedSizeBlockAllocator {
         }
     }
 
-    /// Unmaps a page that has been fully returned to the free lists so that any access to memory that was freed from
-    /// it faults. If the page cannot be unmapped it is returned to circulation instead.
-    fn retire_page(&self, page_base: usize) {
+    /// Unmaps pages that have been taken out of circulation, so that any access to memory that was freed from them
+    /// faults. If they cannot be unmapped they are placed back into circulation instead.
+    fn retire_pages(&self, pages: Range<usize>) {
         if self.updating_page_attributes.swap(true, Ordering::Acquire) {
-            // Re-entered from a GCD attribute update; leave the page in circulation rather than recursing.
-            self.lock().restore_page(page_base);
+            // Re-entered from a GCD attribute update; leave the pages in circulation rather than recursing.
+            self.lock().restore_pages(pages);
             return;
         }
 
-        let result = self.update_page_attributes(page_base, |attributes| attributes | efi::MEMORY_RP | efi::MEMORY_XP);
+        let result = self.update_page_attributes(&pages, |attributes| attributes | efi::MEMORY_RP | efi::MEMORY_XP);
+        if result.is_ok() {
+            self.lock().mark_pages_retired(pages.clone());
+        }
         self.updating_page_attributes.store(false, Ordering::Release);
 
         if let Err(err) = result {
-            log::error!("Failed to unmap freed pool page {page_base:#x}: {err:?}");
-            self.lock().restore_page(page_base);
+            log::error!("Failed to unmap pool pages {:#x}-{:#x}: {err:?}", pages.start, pages.end);
+            self.lock().restore_pages(pages);
         }
     }
 
-    /// Re-maps a previously retired page and returns it to the backing allocator.
+    /// Maps up to `count` contiguous retired pages and returns them to the backing allocator.
     ///
-    /// Returns `true` if a page was returned to service.
-    fn reclaim_page(&self) -> bool {
+    /// Returns `true` if any pages were returned to service.
+    fn reclaim_pages(&self, count: usize) -> bool {
         if self.updating_page_attributes.swap(true, Ordering::Acquire) {
             return false;
         }
 
         // Note: the lock is released before updating attributes, as the GCD allocates and frees pool memory.
-        let retired_page = self.lock().find_retired_page();
+        let retired_pages = self.lock().find_retired_pages(count);
 
         let mut reclaimed = false;
-        if let Some(page_base) = retired_page {
-            match self.update_page_attributes(page_base, |attributes| attributes & !efi::MEMORY_RP) {
+        if let Some(pages) = retired_pages {
+            match self.update_page_attributes(&pages, |attributes| attributes & !efi::MEMORY_RP) {
                 Ok(()) => {
-                    self.lock().restore_page(page_base);
+                    self.lock().restore_pages(pages);
                     reclaimed = true;
                 }
-                Err(err) => log::error!("Failed to re-map retired pool page {page_base:#x}: {err:?}"),
+                Err(err) => log::error!("Failed to re-map retired pool pages {:#x}: {err:?}", pages.start),
             }
         }
 
@@ -982,7 +1068,25 @@ impl SpinLockedFixedSizeBlockAllocator {
     /// Returns an iterator of the ranges of memory owned by this allocator
     /// Returns an empty iterator if the allocator does not own any memory.
     pub fn get_memory_ranges(&self) -> alloc::vec::IntoIter<Range<usize>> {
-        let ranges: Vec<_> = self.lock().get_memory_ranges().collect();
+        let mut ranges = Vec::new();
+
+        // The vector is grown with the lock released, since this allocator may be the one backing the global
+        // allocator, in which case allocating while holding its lock would be a re-entrant lock.
+        loop {
+            let count = self.lock().get_memory_ranges().count();
+            if count < ranges.capacity() {
+                break;
+            }
+            ranges.reserve(count + 1);
+        }
+
+        let allocator = self.lock();
+        // Bounded by the reserved capacity so that pushing cannot reallocate while the lock is held.
+        for range in allocator.get_memory_ranges().take(ranges.capacity()) {
+            ranges.push(range);
+        }
+        drop(allocator);
+
         ranges.into_iter()
     }
 
@@ -1039,8 +1143,12 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                 const _: () = assert!(ALIGNMENT.is_multiple_of(align_of::<AllocatorListNode>()));
                 const _: () = assert!(ALIGNMENT.is_multiple_of(UEFI_PAGE_SIZE) && ALIGNMENT > 0);
 
-                // Bring previously retired pages back into service before claiming more memory from the GCD.
-                while self.reclaim_page() {
+                // Map at least enough pages to satisfy the request, but map them in batches so that a run of
+                // allocations does not require a page table update for each page.
+                let reclaim_pages = max(RECLAIM_BATCH_PAGES, uefi_size_to_pages!(additional_mem_required));
+
+                // Bring retired pages back into service before claiming more memory from the GCD.
+                while self.reclaim_pages(reclaim_pages) {
                     if let Ok(alloc) = self.lock().alloc(layout) {
                         return Ok(alloc);
                     }
@@ -1085,17 +1193,26 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                     debug_assert!(false);
                     AllocError
                 })?;
-                if self.lock().expand(NonNull::slice_from_raw_parts(allocated_ptr, allocation_size)).is_err() {
+                let Ok(new_pages) = self.lock().expand(NonNull::slice_from_raw_parts(allocated_ptr, allocation_size))
+                else {
                     debug_assert!(false);
                     return Err(AllocError);
+                };
+
+                // Done outside of the lock: the GCD allocates and frees pool memory while updating attributes.
+                if let Some(new_pages) = new_pages {
+                    self.retire_pages(new_pages);
                 }
 
-                // Try the allocation one more time
-                if let Ok(alloc) = self.lock().alloc(layout) {
-                    Ok(alloc)
-                } else {
-                    debug_assert!(false);
-                    Err(AllocError)
+                // The new region starts unmapped, so map pages back in until the allocation can be satisfied.
+                loop {
+                    if let Ok(alloc) = self.lock().alloc(layout) {
+                        return Ok(alloc);
+                    }
+                    if !self.reclaim_pages(reclaim_pages) {
+                        debug_assert!(false);
+                        return Err(AllocError);
+                    }
                 }
             }
             Err(_) => {
@@ -1110,7 +1227,7 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
 
         // Done outside of the lock: the GCD allocates and frees pool memory while updating attributes.
         if let Some(page_base) = retired_page {
-            self.retire_page(page_base);
+            self.retire_pages(page_base..page_base + UEFI_PAGE_SIZE);
         }
     }
 }
@@ -1362,11 +1479,14 @@ mod tests {
                     )
                     .unwrap();
 
-                fsb.expand(NonNull::slice_from_raw_parts(
-                    NonNull::new(allocated_address as *mut u8).unwrap(),
-                    allocation_size,
-                ))
-                .unwrap();
+                // A single page region is entirely consumed by the region header, so there is no whole page to retire.
+                let retired = fsb
+                    .expand(NonNull::slice_from_raw_parts(
+                        NonNull::new(allocated_address as *mut u8).unwrap(),
+                        allocation_size,
+                    ))
+                    .unwrap();
+                assert_eq!(retired, None);
 
                 assert!(fsb.allocators.is_some());
                 // SAFETY: fsb.allocators points to valid list nodes after expand.
@@ -1394,11 +1514,15 @@ mod tests {
                     )
                     .unwrap();
 
-                fsb.expand(NonNull::slice_from_raw_parts(
-                    NonNull::new(allocated_address as *mut u8).unwrap(),
-                    allocation_size,
-                ))
-                .unwrap();
+                // The whole page in this region starts retired, so it is not available to the backing allocator.
+                let retired = fsb
+                    .expand(NonNull::slice_from_raw_parts(
+                        NonNull::new(allocated_address as *mut u8).unwrap(),
+                        allocation_size,
+                    ))
+                    .unwrap();
+                assert_eq!(retired, Some(allocated_address + UEFI_PAGE_SIZE..allocated_address + allocation_size));
+
                 assert!(fsb.allocators.is_some());
                 // SAFETY: fsb.allocators points to valid list nodes after expand.
                 unsafe {
@@ -1407,8 +1531,10 @@ mod tests {
                     assert!((*fsb.allocators.unwrap()).allocator.bottom() as usize > base as usize);
                     assert_eq!(
                         (*fsb.allocators.unwrap()).allocator.free(),
-                        //expected free: size of the region less the region header.
-                        allocation_size - RegionHeader::new(allocated_address, allocation_size).unwrap().size
+                        //expected free: size of the region less the region header and the retired page.
+                        allocation_size
+                            - RegionHeader::new(allocated_address, allocation_size).unwrap().size
+                            - UEFI_PAGE_SIZE
                     );
                 }
             });
@@ -1985,8 +2111,9 @@ mod tests {
             };
 
             let stats = fsb.stats();
-            //an additional allocation call will be made as the first one will fail due to a lack of memory
-            assert_eq!(stats.pool_allocation_calls, 2);
+            //additional allocation calls are made as the first one fails for a lack of memory and the second fails
+            //until the memory claimed from the GCD has been mapped in.
+            assert_eq!(stats.pool_allocation_calls, 3);
             assert_eq!(stats.pool_free_calls, 0);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2000,8 +2127,7 @@ mod tests {
             }
 
             let stats = fsb.stats();
-            //an additional allocation call will be made as the first one will fail due to a lack of memory
-            assert_eq!(stats.pool_allocation_calls, 2);
+            assert_eq!(stats.pool_allocation_calls, 3);
             assert_eq!(stats.pool_free_calls, 1);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2020,8 +2146,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node.
 
             let stats = fsb.stats();
-            //an additional allocation call will be made as the first one will fail due to a lack of memory
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 1);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2041,7 +2166,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2060,7 +2185,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 1);
             assert_eq!(stats.page_free_calls, 0);
@@ -2080,7 +2205,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 1);
             assert_eq!(stats.page_free_calls, 1);
@@ -2099,7 +2224,7 @@ mod tests {
             //104 pages (1MB+16K) page as a result of allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 2);
             assert_eq!(stats.page_free_calls, 1);
@@ -2119,7 +2244,7 @@ mod tests {
             //104 pages (1MB+16K) page as a result of allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 3);
             assert_eq!(stats.page_free_calls, 1);
@@ -2143,7 +2268,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 4);
+            assert_eq!(stats.pool_allocation_calls, 6);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 3);
             assert_eq!(stats.page_free_calls, 3);
@@ -2293,10 +2418,12 @@ mod tests {
             assert!(page_base.is_multiple_of(UEFI_PAGE_SIZE));
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, 0);
 
+            let retired = fsb.stats().retired_pages;
+
             // SAFETY: allocation was returned by fsb for this layout.
             unsafe { fsb.deallocate(allocation, layout) };
 
-            assert_eq!(fsb.stats().retired_pages, 1);
+            assert_eq!(fsb.stats().retired_pages, retired + 1);
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, efi::MEMORY_RP);
 
             // The retired page is out of circulation, so it is not handed back out.
@@ -2314,11 +2441,12 @@ mod tests {
             let small = Layout::from_size_align(0x20, 0x20).unwrap();
             let allocation = fsb.allocate(small).unwrap().cast::<u8>();
             let page_base = align_down_size(allocation.addr().get(), UEFI_PAGE_SIZE);
+            let retired = fsb.stats().retired_pages;
 
             // SAFETY: allocation was returned by fsb for this layout.
             unsafe { fsb.deallocate(allocation, small) };
 
-            assert_eq!(fsb.stats().retired_pages, 0);
+            assert_eq!(fsb.stats().retired_pages, retired);
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, 0);
         });
     }
@@ -2333,11 +2461,12 @@ mod tests {
             let large = Layout::from_size_align(UEFI_PAGE_SIZE * 2, UEFI_PAGE_SIZE).unwrap();
             let allocation = fsb.allocate(large).unwrap().cast::<u8>();
             let page_base = allocation.addr().get();
+            let retired = fsb.stats().retired_pages;
 
             // SAFETY: allocation was returned by fsb for this layout.
             unsafe { fsb.deallocate(allocation, large) };
 
-            assert_eq!(fsb.stats().retired_pages, 0);
+            assert_eq!(fsb.stats().retired_pages, retired);
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, 0);
         });
     }
@@ -2352,13 +2481,14 @@ mod tests {
             const BLOCK_COUNT: usize = 1024;
             let layout = Layout::from_size_align(0x8, 0x8).unwrap();
             let allocations: Vec<_> = (0..BLOCK_COUNT).map(|_| fsb.allocate(layout).unwrap().cast::<u8>()).collect();
+            let retired = fsb.stats().retired_pages;
 
             for allocation in &allocations {
                 // SAFETY: each allocation was returned by fsb for this layout.
                 unsafe { fsb.deallocate(*allocation, layout) };
             }
 
-            assert!(fsb.stats().retired_pages > 0);
+            assert!(fsb.stats().retired_pages > retired);
 
             // The free lists are still consistent and never hand out memory that has been unmapped.
             for _ in 0..BLOCK_COUNT / 2 {
@@ -2382,14 +2512,77 @@ mod tests {
             unsafe { fsb.deallocate(allocation, layout) };
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, efi::MEMORY_RP);
 
-            assert!(fsb.reclaim_page());
-            assert_eq!(fsb.stats().reclaimed_pages, 1);
+            // The freed page is the lowest retired page, so it is the next one brought back into service.
+            let reclaimed = fsb.stats().reclaimed_pages;
+            assert!(fsb.reclaim_pages(1));
+            assert_eq!(fsb.stats().reclaimed_pages, reclaimed + 1);
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, 0);
 
-            // Nothing is left to reclaim and the reclaimed memory is available again.
-            assert!(!fsb.reclaim_page());
-            assert!(fsb.lock().find_retired_page().is_none());
-            assert!(fsb.allocate(layout).is_ok());
+            // The reclaimed memory is available again.
+            assert_eq!(fsb.allocate(layout).unwrap().cast::<u8>().addr().get(), page_base);
+        });
+    }
+
+    #[test]
+    fn test_new_region_starts_unmapped() {
+        with_locked_state(|| {
+            static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+            let fsb = fsb_with_gcd(&GCD);
+
+            let layout = Layout::from_size_align(0x20, 0x20).unwrap();
+            let allocation = fsb.allocate(layout).unwrap().cast::<u8>();
+
+            // Only the pages needed to satisfy the allocation are mapped; the rest of the region the allocator
+            // claimed from the GCD stays unmapped until it is needed.
+            let region = fsb.get_memory_ranges().next().unwrap();
+            let mapped = (region.start..region.end)
+                .step_by(UEFI_PAGE_SIZE)
+                .filter(|page| page_attributes(&GCD, *page) & efi::MEMORY_RP == 0)
+                .count();
+
+            assert!(mapped <= RECLAIM_BATCH_PAGES + 1, "{mapped} pages mapped");
+            assert!(mapped < uefi_size_to_pages!(region.len()));
+            assert_eq!(page_attributes(&GCD, allocation.addr().get()) & efi::MEMORY_RP, 0);
+        });
+    }
+
+    #[test]
+    fn test_pages_awaiting_unmap_are_not_reclaimable() {
+        with_locked_state(|| {
+            static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+            init_gcd(&GCD, 0x400000);
+
+            let mut fsb = FixedSizeBlockAllocator::new(efi::BOOT_SERVICES_DATA, DEFAULT_PAGE_ALLOCATION_GRANULARITY);
+
+            let region_size = 0x4000;
+            let region = GCD
+                .allocate_memory_space(
+                    DEFAULT_ALLOCATION_STRATEGY,
+                    GcdMemoryType::SystemMemory,
+                    UEFI_PAGE_SHIFT,
+                    region_size,
+                    DUMMY_HANDLE,
+                    None,
+                )
+                .unwrap();
+
+            let pages = fsb
+                .expand(NonNull::slice_from_raw_parts(NonNull::new(region as *mut u8).unwrap(), region_size))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pages, region + UEFI_PAGE_SIZE..region + region_size);
+
+            // The pages are out of circulation but still mapped, so they must not be brought back into service until
+            // the caller reports that they have been unmapped.
+            assert_eq!(fsb.find_retired_pages(usize::MAX), None);
+
+            fsb.mark_pages_retired(pages.clone());
+            assert_eq!(fsb.find_retired_pages(usize::MAX), Some(pages.clone()));
+
+            // Restoring them puts them back into the backing allocator.
+            fsb.restore_pages(pages);
+            assert_eq!(fsb.find_retired_pages(usize::MAX), None);
+            assert!(fsb.alloc(Layout::from_size_align(UEFI_PAGE_SIZE, UEFI_PAGE_SIZE).unwrap()).is_ok());
         });
     }
 }
