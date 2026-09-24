@@ -18,7 +18,7 @@ use crate::{gcd::SpinLockedGcd, tpl_mutex};
 use alloc::vec::Vec;
 use core::{
     alloc::{AllocError, Allocator, GlobalAlloc, Layout},
-    cmp::max,
+    cmp::{max, min},
     debug_assert,
     fmt::{self, Display},
     mem::{align_of, size_of},
@@ -828,18 +828,27 @@ impl SpinLockedFixedSizeBlockAllocator {
     /// Note: the FSB lock must not be held when calling this, as the GCD allocates and frees pool memory.
     fn update_page_attributes<F>(&self, pages: &Range<usize>, update: F) -> Result<(), EfiError>
     where
-        F: FnOnce(u64) -> u64,
+        F: Fn(u64) -> u64,
     {
-        let descriptor = self.gcd.get_memory_descriptor_for_address(pages.start as efi::PhysicalAddress, |d, _| {
-            d.memory_type != GcdMemoryType::NonExistent
-        })?;
+        let mut base = pages.start;
+        while base < pages.end {
+            let descriptor = self.gcd.get_memory_descriptor_for_address(base as efi::PhysicalAddress, |d, _| {
+                d.memory_type != GcdMemoryType::NonExistent
+            })?;
+            let descriptor_end =
+                usize::try_from(descriptor.base_address + descriptor.length).map_err(|_| EfiError::InvalidParameter)?;
+            let end = min(pages.end, descriptor_end);
 
-        match self.gcd.set_memory_space_attributes(pages.start, pages.len(), update(descriptor.attributes)) {
-            // NotReady means the page table is not installed yet; the GCD has been updated and the page table will
-            // pick the attributes up when paging is initialized.
-            Ok(()) | Err(EfiError::NotReady) => Ok(()),
-            Err(err) => Err(err),
+            match self.gcd.set_memory_space_attributes(base, end - base, update(descriptor.attributes)) {
+                // NotReady means the page table is not installed yet; the GCD has been updated and the page table will
+                // pick the attributes up when paging is initialized.
+                Ok(()) | Err(EfiError::NotReady) => {}
+                Err(err) => return Err(err),
+            }
+            base = end;
         }
+
+        Ok(())
     }
 
     /// Unmaps pages that have been taken out of circulation, so that any access to memory that was freed from them
@@ -2448,6 +2457,34 @@ mod tests {
 
             assert_eq!(fsb.stats().retired_pages, retired);
             assert_eq!(page_attributes(&GCD, page_base) & efi::MEMORY_RP, 0);
+        });
+    }
+
+    #[test]
+    fn test_update_page_attributes_preserves_gcd_access_attributes() {
+        with_locked_state(|| {
+            static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+            let fsb = fsb_with_gcd(&GCD);
+            let allocation = fsb.allocate(Layout::from_size_align(0x20, 0x20).unwrap()).unwrap().cast::<u8>();
+            let first_page = align_down_size(allocation.addr().get(), UEFI_PAGE_SIZE);
+            let second_page = first_page + UEFI_PAGE_SIZE;
+
+            assert_eq!(
+                GCD.set_memory_space_attributes(first_page, UEFI_PAGE_SIZE, efi::MEMORY_WB | efi::MEMORY_XP),
+                Err(EfiError::NotReady)
+            );
+            assert_eq!(
+                GCD.set_memory_space_attributes(second_page, UEFI_PAGE_SIZE, efi::MEMORY_WB | efi::MEMORY_RO),
+                Err(EfiError::NotReady)
+            );
+
+            fsb.update_page_attributes(&(first_page..second_page + UEFI_PAGE_SIZE), |attributes| {
+                attributes | efi::MEMORY_RP
+            })
+            .unwrap();
+
+            assert_eq!(page_attributes(&GCD, first_page), efi::MEMORY_WB | efi::MEMORY_XP | efi::MEMORY_RP);
+            assert_eq!(page_attributes(&GCD, second_page), efi::MEMORY_WB | efi::MEMORY_RO | efi::MEMORY_RP);
         });
     }
 

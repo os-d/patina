@@ -2599,6 +2599,28 @@ fn test_set_paging_attributes_with_page_table() {
 }
 
 #[test]
+fn test_set_paging_attributes_normalizes_inconsistent_access_attributes() {
+    with_locked_state(|| {
+        static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+        GCD.init(48, 16);
+
+        let mock_table = Rc::new(RefCell::new(MockPageTable::new()));
+        mock_table.borrow().fail_next_query_memory_region(
+            PtError::InconsistentMappingAcrossRange,
+            CacheAttributeValue::Valid(MemoryAttributes::Writeback),
+        );
+        GCD.add_test_page_table(Box::new(MockPageTableWrapper::new(Rc::clone(&mock_table))));
+
+        let base_address = 0x1000;
+        let length = 0x2000;
+        let attributes = MemoryAttributes::Writeback | MemoryAttributes::ExecuteProtect;
+
+        assert_eq!(GCD.set_paging_attributes(base_address, length, attributes.bits()), Ok(()));
+        assert_eq!(mock_table.borrow().get_mapped_regions(), vec![(base_address as u64, length as u64, attributes)]);
+    });
+}
+
+#[test]
 fn test_map_aliased_memory_region() {
     with_locked_state(|| {
         static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
