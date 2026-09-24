@@ -618,6 +618,14 @@ impl FixedSizeBlockAllocator {
         }
     }
 
+    /// Makes pages from a new, still-mapped expansion available to the backing allocator.
+    fn activate_new_pages(&mut self, pages: Range<usize>) {
+        let page_count = pages.len() >> UEFI_PAGE_SHIFT;
+        self.restore_pages(pages);
+        self.stats.retired_pages = self.stats.retired_pages.saturating_sub(page_count);
+        self.stats.reclaimed_pages = self.stats.reclaimed_pages.saturating_sub(page_count);
+    }
+
     /// Returns a retired page to the backing allocator that owns it, making it available for allocation again.
     ///
     /// The caller must ensure the page is mapped before calling this.
@@ -1208,9 +1216,16 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                     return Err(AllocError);
                 };
 
-                // Done outside of the lock: the GCD allocates and frees pool memory while updating attributes.
+                // The expansion is already mapped. Keep the first batch available and unmap only the remainder,
+                // avoiding an immediate unmap/remap cycle while producing the same final allocator state.
                 if let Some(new_pages) = new_pages {
-                    self.retire_pages(new_pages);
+                    let active_end = min(new_pages.end, new_pages.start + uefi_pages_to_size!(reclaim_pages));
+                    self.lock().activate_new_pages(new_pages.start..active_end);
+
+                    // Done outside of the lock: the GCD allocates and frees pool memory while updating attributes.
+                    if active_end < new_pages.end {
+                        self.retire_pages(active_end..new_pages.end);
+                    }
                 }
 
                 // The new region starts unmapped, so map pages back in until the allocation can be satisfied.
@@ -2120,9 +2135,8 @@ mod tests {
             };
 
             let stats = fsb.stats();
-            //additional allocation calls are made as the first one fails for a lack of memory and the second fails
-            //until the memory claimed from the GCD has been mapped in.
-            assert_eq!(stats.pool_allocation_calls, 3);
+            // An additional allocation call is made after the first one expands the allocator.
+            assert_eq!(stats.pool_allocation_calls, 2);
             assert_eq!(stats.pool_free_calls, 0);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2136,7 +2150,7 @@ mod tests {
             }
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 3);
+            assert_eq!(stats.pool_allocation_calls, 2);
             assert_eq!(stats.pool_free_calls, 1);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2155,7 +2169,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 1);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2175,7 +2189,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 0);
             assert_eq!(stats.page_free_calls, 0);
@@ -2194,7 +2208,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 1);
             assert_eq!(stats.page_free_calls, 0);
@@ -2214,7 +2228,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 1);
             assert_eq!(stats.page_free_calls, 1);
@@ -2233,7 +2247,7 @@ mod tests {
             //104 pages (1MB+16K) page as a result of allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 2);
             assert_eq!(stats.page_free_calls, 1);
@@ -2253,7 +2267,7 @@ mod tests {
             //104 pages (1MB+16K) page as a result of allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 3);
             assert_eq!(stats.page_free_calls, 1);
@@ -2277,7 +2291,7 @@ mod tests {
             //3MB+1 page range as a result of 3MB allocation + 1 page to hold allocator node - available for pool allocation.
 
             let stats = fsb.stats();
-            assert_eq!(stats.pool_allocation_calls, 6);
+            assert_eq!(stats.pool_allocation_calls, 4);
             assert_eq!(stats.pool_free_calls, 2);
             assert_eq!(stats.page_allocation_calls, 3);
             assert_eq!(stats.page_free_calls, 3);
