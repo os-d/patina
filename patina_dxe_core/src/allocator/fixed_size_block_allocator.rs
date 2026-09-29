@@ -204,6 +204,12 @@ pub struct FixedSizeBlockAllocator {
     /// blocks or if the required fixed-size block list is empty.
     allocators: Option<*mut AllocatorListNode>,
 
+    /// Most recently used allocator node for per-page accounting.
+    page_accounting_node: Option<*mut AllocatorListNode>,
+
+    /// Most recently used allocator node for backing-heap allocations.
+    backing_allocator_node: Option<*mut AllocatorListNode>,
+
     /// The range of memory that is reserved for this allocator. This is used to stabilize the memory map during an
     /// S4 resume.
     pub(crate) reserved_range: Option<Range<efi::PhysicalAddress>>,
@@ -226,6 +232,8 @@ impl FixedSizeBlockAllocator {
             list_heads: [EMPTY; BLOCK_SIZES.len()],
             list_tails: [EMPTY; BLOCK_SIZES.len()],
             allocators: None,
+            page_accounting_node: None,
+            backing_allocator_node: None,
             reserved_range: None,
             stats: AllocationStatistics::new(),
             page_allocation_granularity,
@@ -240,6 +248,8 @@ impl FixedSizeBlockAllocator {
         self.list_heads = [EMPTY; BLOCK_SIZES.len()];
         self.list_tails = [EMPTY; BLOCK_SIZES.len()];
         self.allocators = None;
+        self.page_accounting_node = None;
+        self.backing_allocator_node = None;
         self.reserved_range = None;
         self.stats = AllocationStatistics::new();
     }
@@ -313,6 +323,8 @@ impl FixedSizeBlockAllocator {
         }
 
         self.allocators = Some(alloc_node_ptr);
+        self.page_accounting_node = Some(alloc_node_ptr);
+        self.backing_allocator_node = Some(alloc_node_ptr);
 
         if self.in_reserved_range(alloc_node_ptr.addr() as efi::PhysicalAddress) {
             self.stats.reserved_used += new_region.len();
@@ -356,10 +368,21 @@ impl FixedSizeBlockAllocator {
     // allocates from the linked-list backing allocator if a free block of the
     // appropriate size is not available.
     fn fallback_alloc(&mut self, layout: Layout) -> Result<NonNull<[u8]>, FixedSizeBlockAllocatorError> {
+        if let Some(node) = self.backing_allocator_node {
+            // SAFETY: allocator nodes remain valid for the lifetime of the allocator.
+            if let Ok(ptr) = unsafe { (*node).allocator.allocate_first_fit(layout) } {
+                return Ok(NonNull::slice_from_raw_parts(ptr, layout.size()));
+            }
+        }
+
         for node in AllocatorIterator::new(self.allocators) {
+            if Some(node) == self.backing_allocator_node {
+                continue;
+            }
             // SAFETY: node is a valid allocator list node pointer from the iterator.
             let allocator = unsafe { &mut (*node).allocator };
             if let Ok(ptr) = allocator.allocate_first_fit(layout) {
+                self.backing_allocator_node = Some(node);
                 return Ok(NonNull::slice_from_raw_parts(ptr, layout.size()));
             }
         }
@@ -429,12 +452,27 @@ impl FixedSizeBlockAllocator {
     // deallocates back to the linked-list backing allocator if the size of
     // layout being freed is too big to be tracked as a fixed-size free block.
     fn fallback_dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        if let Some(node) = self.backing_allocator_node {
+            // SAFETY: allocator nodes remain valid for the lifetime of the allocator.
+            let allocator = unsafe { &mut (*node).allocator };
+            if (allocator.bottom() <= ptr.as_ptr()) && (ptr.as_ptr() < allocator.top()) {
+                // SAFETY: ptr was allocated by this allocator for the given layout.
+                unsafe { allocator.deallocate(ptr, layout) };
+                return;
+            }
+        }
+
         for node in AllocatorIterator::new(self.allocators) {
+            if Some(node) == self.backing_allocator_node {
+                continue;
+            }
             // SAFETY: node is produced by AllocatorIterator and points to a valid AllocatorListNode.
             let allocator = unsafe { &mut (*node).allocator };
             if (allocator.bottom() <= ptr.as_ptr()) && (ptr.as_ptr() < allocator.top()) {
                 // SAFETY: ptr was allocated by this allocator for the given layout.
                 unsafe { allocator.deallocate(ptr, layout) };
+                self.backing_allocator_node = Some(node);
+                return;
             }
         }
     }
@@ -482,11 +520,20 @@ impl FixedSizeBlockAllocator {
     }
 
     /// Returns the region node that tracks the page containing `address`, if any.
-    fn node_for_address(&self, address: usize) -> Option<*mut AllocatorListNode> {
-        AllocatorIterator::new(self.allocators).find(|&node| {
+    fn node_for_address(&mut self, address: usize) -> Option<*mut AllocatorListNode> {
+        if let Some(node) = self.page_accounting_node {
+            // SAFETY: allocator nodes remain valid for the lifetime of the allocator.
+            if unsafe { (*node).page_index(address).is_some() } {
+                return Some(node);
+            }
+        }
+
+        let node = AllocatorIterator::new(self.allocators).find(|&node| {
             // SAFETY: node is produced by AllocatorIterator and points to a valid AllocatorListNode.
             unsafe { (*node).page_index(address).is_some() }
-        })
+        });
+        self.page_accounting_node = node;
+        node
     }
 
     /// Records that a fixed-size block was taken off of the free lists.
