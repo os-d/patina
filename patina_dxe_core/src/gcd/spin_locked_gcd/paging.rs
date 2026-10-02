@@ -186,6 +186,12 @@ impl SpinLockedGcd {
                         }
                     }
                 }
+                Err((PtError::InconsistentMappingAcrossRange, CacheAttributeValue::Valid(cache_attributes))) => {
+                    // The inherited page table may use different access attributes within a GCD descriptor. The map
+                    // below normalizes the full range to the GCD state; consistent cacheability is required so cache
+                    // maintenance remains well-defined.
+                    Some(cache_attributes)
+                }
                 Err(e) => {
                     log::error!(
                         "query memory region {base_address:#x?} of length {len:#x?} with attributes {attributes:#x?}. Status: {e:#x?}",

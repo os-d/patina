@@ -119,6 +119,7 @@ pub struct MockPageTable {
     unmapped: RefCell<Vec<(u64, u64)>>,
     map_aliased_error: Option<PtError>,
     unmap_error: Option<PtError>,
+    query_error: RefCell<Option<(PtError, CacheAttributeValue)>>,
     installed: RefCell<bool>,
     // Track current mappings to provide realistic query behavior
     current_mappings: RefCell<Vec<(u64, u64, MemoryAttributes)>>,
@@ -174,6 +175,10 @@ impl PatinaPageTable for MockPageTable {
     }
 
     fn query_memory_region(&self, base: u64, len: u64) -> Result<MemoryAttributes, (PtError, CacheAttributeValue)> {
+        if let Some(error) = self.query_error.borrow_mut().take() {
+            return Err(error);
+        }
+
         let current = self.current_mappings.borrow();
         let end = base + len;
 
@@ -227,6 +232,10 @@ impl MockPageTable {
         self.unmap_error = Some(error);
     }
 
+    pub fn fail_next_query_memory_region(&self, error: PtError, cache_attributes: CacheAttributeValue) {
+        *self.query_error.borrow_mut() = Some((error, cache_attributes));
+    }
+
     pub fn get_mapped_regions(&self) -> Vec<(u64, u64, MemoryAttributes)> {
         self.mapped.borrow().clone()
     }
@@ -250,6 +259,7 @@ impl MockPageTable {
             unmapped: RefCell::new(Vec::new()),
             map_aliased_error: None,
             unmap_error: None,
+            query_error: RefCell::new(None),
             installed: RefCell::new(false),
             current_mappings: RefCell::new(Vec::new()),
         }
