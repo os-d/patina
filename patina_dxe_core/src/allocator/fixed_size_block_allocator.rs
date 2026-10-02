@@ -1199,7 +1199,7 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
 
                 // Map at least enough pages to satisfy the request, but map them in batches so that a run of
                 // allocations does not require a page table update for each page.
-                let reclaim_pages = max(RECLAIM_BATCH_PAGES, uefi_size_to_pages!(additional_mem_required));
+                let reclaim_pages = uefi_size_to_pages!(additional_mem_required);
 
                 // Bring retired pages back into service before claiming more memory from the GCD.
                 while self.reclaim_pages(reclaim_pages) {
