@@ -78,8 +78,8 @@ struct AllocatorListNode {
     /// The number of bytes of each whole page in this region that are currently sitting on the fixed-size block free
     /// lists, along with the [`AllocatorListNode::RETIRED_PAGE`] and [`AllocatorListNode::RETIRING_PAGE`] states.
     ///
-    /// This is stored in the metadata header of the first page of this region for every page in the region. The page
-    /// with the metadata will never be retired so that we can access the metadata.
+    /// This is stored in the metadata header at the front of the region for every page in the region. Pages containing
+    /// metadata are never retired so that the metadata remains accessible.
     page_free_bytes: &'static mut [u16],
 }
 
@@ -123,7 +123,7 @@ struct RegionHeader {
     size: usize,
     /// The offset of the per-page metadata array within the region.
     meta_offset: usize,
-    /// The number of pages contained in the region, including the first page that contains the metadata.
+    /// The number of pages contained in the region, including the pages that contain the metadata.
     page_count: usize,
 }
 
@@ -132,11 +132,24 @@ impl RegionHeader {
         let (layout, meta_offset) =
             Layout::new::<AllocatorListNode>().extend(Layout::array::<u16>(page_count).ok()?).ok()?;
 
-        if layout.pad_to_align().size() > UEFI_PAGE_SIZE {
-            return None;
-        }
-
         Some(Self { size: layout.pad_to_align().size(), meta_offset, page_count })
+    }
+
+    /// Returns the page-aligned region size needed to hold `payload_size` bytes after the region header.
+    fn region_size_for_payload(payload_size: usize) -> Option<usize> {
+        let mut page_count = 1;
+
+        loop {
+            let header = Self::new(page_count)?;
+            let region_size = align_up(payload_size.checked_add(header.size)?, UEFI_PAGE_SIZE).ok()?;
+            let required_page_count = region_size / UEFI_PAGE_SIZE;
+
+            if required_page_count == page_count {
+                return Some(region_size);
+            }
+
+            page_count = required_page_count;
+        }
     }
 }
 
@@ -241,9 +254,9 @@ impl FixedSizeBlockAllocator {
     /// node to manage this range. The region is partially consumed by an `AllocatorListNode` and the per-page tracking
     /// metadata for the region; the remainder is available to the allocator.
     ///
-    /// Every page of the new region after the first (where the metadata is stored) starts retired, so the allocator
-    /// does not have any memory mapped that it has not handed out yet. The returned range is the memory the caller
-    /// must unmap, or must hand to [`Self::restore_pages`] if it cannot be unmapped.
+    /// Every whole page of the new region after the metadata starts retired, so the allocator does not have any memory
+    /// mapped that it has not handed out yet. The returned range is the memory the caller must unmap, or must hand to
+    /// [`Self::restore_pages`] if it cannot be unmapped.
     ///
     /// ## Errors
     ///
@@ -265,8 +278,10 @@ impl FixedSizeBlockAllocator {
         }
 
         // Only whole pages contained within the region are tracked for retirement.
-        let header = RegionHeader::new(uefi_size_to_pages!(new_region.len()))
-            .ok_or(FixedSizeBlockAllocatorError::InvalidExpansion)?;
+        let header = RegionHeader::new(uefi_size_to_pages!(new_region.len())).ok_or_else(|| {
+            debug_assert!(false, "FSB expanded with insufficiently sized memory region.");
+            FixedSizeBlockAllocatorError::InvalidExpansion
+        })?;
 
         // Ensure we're expanding enough to fit the node and its page metadata
         if new_region.len() <= header.size {
@@ -286,8 +301,10 @@ impl FixedSizeBlockAllocator {
 
         let heap_region: NonNull<[u8]> = NonNull::slice_from_raw_parts(
             // SAFETY: header.size is less than the region length, as validated above.
-            NonNull::new(unsafe { new_region.as_ptr().cast::<u8>().add(header.size) })
-                .ok_or(FixedSizeBlockAllocatorError::InvalidExpansion)?,
+            NonNull::new(unsafe { new_region.as_ptr().cast::<u8>().add(header.size) }).ok_or_else(|| {
+                debug_assert!(false, "FSB expanded with insufficiently sized memory region.");
+                FixedSizeBlockAllocatorError::InvalidExpansion
+            })?,
             new_region.len() - header.size,
         );
 
@@ -316,8 +333,8 @@ impl FixedSizeBlockAllocator {
         self.retire_new_region(alloc_node_ptr)
     }
 
-    /// Takes every page of a newly expanded region except the first that tracks metadata out of its backing allocator
-    /// and marks it retired, so that the pages are not handed out until they have been mapped.
+    /// Takes every whole page of a newly expanded region after its metadata out of its backing allocator and marks it
+    /// retired, so that the pages are not handed out until they have been mapped.
     ///
     /// Returns the range covered by those pages, or `None` if the region contains no whole pages after its metadata.
     fn retire_new_region(
@@ -329,7 +346,7 @@ impl FixedSizeBlockAllocator {
 
         let pages = align_up_size(heap_start, UEFI_PAGE_SIZE)..align_down_size(heap_end, UEFI_PAGE_SIZE);
         if pages.is_empty() {
-            // We only have the metadata page, which can't be retired, but that is okay
+            // The region contains no whole heap pages after its metadata, but its partial page remains usable.
             return Ok(None);
         }
 
@@ -369,14 +386,10 @@ impl FixedSizeBlockAllocator {
         //  3 * size_of::<usize>. The size reservation for `additional_mem_required` assumed the largest size.
         let allocation_size = layout.pad_to_align().size() + 3 * size_of::<usize>();
 
-        // We keep metadata in the RegionHeader, which is at max one page and could bump us into one additional page,
-        // requiring an extra allocator node.
-        let page_count =
-            uefi_size_to_pages!(allocation_size + Layout::new::<AllocatorListNode>().pad_to_align().size()) + 1;
-        let header = RegionHeader::new(page_count).ok_or(FixedSizeBlockAllocatorError::InvalidExpansion)?;
-        let additional_mem_required =
-            allocation_size.checked_add(header.size).ok_or(FixedSizeBlockAllocatorError::InvalidExpansion)?;
-        let additional_mem_required = align_up_size(additional_mem_required, align_of::<AllocatorListNode>());
+        let additional_mem_required = RegionHeader::region_size_for_payload(allocation_size).ok_or_else(|| {
+            debug_assert!(false, "FSB expanded with insufficiently sized memory region.");
+            FixedSizeBlockAllocatorError::InvalidExpansion
+        })?;
 
         Err(FixedSizeBlockAllocatorError::OutOfMemory(additional_mem_required))
     }
@@ -1324,7 +1337,7 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                     )?;
 
                 if RegionHeader::new(required_pages).is_none() {
-                    log::error!("Allocator expansion metadata for {required_pages:#x} pages exceeds one UEFI page.");
+                    log::error!("Allocator expansion metadata is invalid for {required_pages:#x} pages.");
                     return Err(AllocError);
                 }
 
@@ -1359,8 +1372,8 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                     return Err(AllocError);
                 };
 
-                // We may only have the free blocks on the metadata page, in which case we can allocate, but don't
-                // have any pages to activate
+                // We may only have free space in a partial page after the metadata, in which case we can allocate but
+                // do not have any whole pages to activate.
                 if let Some(new_pages) = new_pages {
                     let active_end = min(new_pages.end, new_pages.start + uefi_pages_to_size!(reclaim_pages));
                     self.lock().activate_new_pages(new_pages.start..active_end);
@@ -1377,7 +1390,12 @@ unsafe impl Allocator for SpinLockedFixedSizeBlockAllocator {
                     AllocError
                 })
             }
-            Err(_) => {
+            Err(e) => {
+                log::error!(
+                    "Allocator failed to expand and allocate new pages for the requested layout: {:?} with error {:?}",
+                    layout,
+                    e
+                );
                 debug_assert!(false);
                 Err(AllocError)
             }
@@ -1614,14 +1632,28 @@ mod tests {
     }
 
     #[test]
-    fn test_region_header_metadata_is_limited_to_one_page() {
-        let maximum_page_count = (0..=UEFI_PAGE_SIZE / size_of::<u16>())
-            .take_while(|page_count| RegionHeader::new(*page_count).is_some())
-            .last()
-            .unwrap();
+    fn test_region_header_supports_metadata_larger_than_one_page() {
+        let page_count = UEFI_PAGE_SIZE;
+        let header = RegionHeader::new(page_count).unwrap();
 
-        assert!(RegionHeader::new(maximum_page_count).unwrap().size <= UEFI_PAGE_SIZE);
-        assert!(RegionHeader::new(maximum_page_count + 1).is_none());
+        assert!(header.size > UEFI_PAGE_SIZE);
+        assert_eq!(header.page_count, page_count);
+    }
+
+    #[test]
+    fn test_region_size_accounts_for_all_page_metadata() {
+        const PAYLOAD_SIZE: usize = 0x1000000;
+
+        let region_size = RegionHeader::region_size_for_payload(PAYLOAD_SIZE).unwrap();
+        let page_count = region_size / UEFI_PAGE_SIZE;
+        let header = RegionHeader::new(page_count).unwrap();
+
+        assert!(header.size > UEFI_PAGE_SIZE);
+        assert!(region_size - header.size >= PAYLOAD_SIZE);
+
+        let smaller_region_size = region_size - UEFI_PAGE_SIZE;
+        let smaller_header = RegionHeader::new(page_count - 1).unwrap();
+        assert!(smaller_region_size - smaller_header.size < PAYLOAD_SIZE);
     }
 
     #[test]
@@ -1815,15 +1847,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fallback_alloc_rejects_metadata_larger_than_one_page() {
+    fn test_fallback_alloc_accounts_for_metadata_larger_than_one_page() {
         let mut fsb = FixedSizeBlockAllocator::new(efi::BOOT_SERVICES_DATA, DEFAULT_PAGE_ALLOCATION_GRANULARITY);
-        let maximum_page_count = (0..=UEFI_PAGE_SIZE / size_of::<u16>())
-            .take_while(|page_count| RegionHeader::new(*page_count).is_some())
-            .last()
-            .unwrap();
-        let layout = Layout::from_size_align(uefi_pages_to_size!(maximum_page_count + 1), align_of::<usize>()).unwrap();
+        let layout = Layout::from_size_align(0x1000000, align_of::<usize>()).unwrap();
 
-        assert!(matches!(fsb.fallback_alloc(layout), Err(FixedSizeBlockAllocatorError::InvalidExpansion)));
+        let Err(FixedSizeBlockAllocatorError::OutOfMemory(region_size)) = fsb.fallback_alloc(layout) else {
+            panic!("fallback_alloc should request a region large enough for the allocation and its metadata");
+        };
+        let header = RegionHeader::new(region_size / UEFI_PAGE_SIZE).unwrap();
+
+        assert!(header.size > UEFI_PAGE_SIZE);
+        assert!(region_size - header.size >= layout.size());
     }
 
     #[test]
@@ -1877,6 +1911,35 @@ mod tests {
                 assert!(fsb.lock().allocators.is_some());
                 assert!((allocation as u64) > base);
                 assert!((allocation as u64) < base + 0x400000);
+            });
+        });
+    }
+
+    #[test]
+    fn test_allocate_with_metadata_larger_than_one_page() {
+        with_granularity_modulation(|granularity| {
+            with_locked_state(|| {
+                static GCD: SpinLockedGcd = SpinLockedGcd::new(None);
+                const ALLOCATION_SIZE: usize = 0x1000000;
+
+                init_gcd(&GCD, ALLOCATION_SIZE * 2);
+                let fsb = SpinLockedFixedSizeBlockAllocator::new(
+                    &GCD,
+                    1 as _,
+                    efi::RUNTIME_SERVICES_DATA,
+                    granularity,
+                    DEFAULT_PAGE_ALLOCATION_GRANULARITY,
+                );
+                let layout = Layout::from_size_align(ALLOCATION_SIZE, align_of::<usize>()).unwrap();
+
+                let allocation = fsb.allocate(layout).unwrap();
+                let claimed_pages = fsb.stats().claimed_pages;
+
+                assert!(RegionHeader::new(claimed_pages).unwrap().size > UEFI_PAGE_SIZE);
+                assert_eq!(allocation.len(), ALLOCATION_SIZE);
+
+                // SAFETY: allocation was returned by fsb for this layout.
+                unsafe { fsb.deallocate(allocation.cast(), layout) };
             });
         });
     }
