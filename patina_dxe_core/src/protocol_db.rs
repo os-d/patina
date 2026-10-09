@@ -592,13 +592,13 @@ impl ProtocolDb {
 
         let child_handles_discovered = child_handles.clone();
 
-        child_handles.sort(); //dedup needs a sorted vector
-        child_handles.dedup(); //remove any duplicate handles
+        let mut child_handle_set = BTreeSet::new();
+        child_handles.retain(|child| child_handle_set.insert(*child));
 
         if !child_handles.is_empty() {
             log::info!(
                 target: "handle_order",
-                "ConnectController children: parent={parent_handle:?}, discovered_order={child_handles_discovered:?}, creation_order={child_handles_by_creation:?}, handle_value_order={child_handles:?}"
+                "ConnectController children: parent={parent_handle:?}, discovered_order={child_handles_discovered:?}, creation_order={child_handles_by_creation:?}, returned_order={child_handles:?}"
             );
         }
 
@@ -2111,9 +2111,12 @@ mod tests {
 
             let uuid1 = Uuid::from_str("0e896c7a-57dc-4987-bc22-abc3a8263210").unwrap();
             let guid1 = efi::Guid::from_bytes(uuid1.as_bytes());
+            let uuid2 = Uuid::from_str("98d32ea1-e980-46b5-bb2c-564934c8cce6").unwrap();
+            let guid2 = efi::Guid::from_bytes(uuid2.as_bytes());
             let interface1: *mut c_void = 0x1234 as *mut c_void;
 
             let (controller, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
+            SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(Some(controller), guid2, interface1).unwrap();
             let (driver, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
             let (child1, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
             let (child2, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
@@ -2121,23 +2124,26 @@ mod tests {
             let (_notchild1, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
             let (_notchild2, _) = SPIN_LOCKED_PROTOCOL_DB.install_protocol_interface(None, guid1, interface1).unwrap();
 
-            for child in [child1, child2, child3] {
-                SPIN_LOCKED_PROTOCOL_DB
-                    .add_protocol_usage(
-                        controller,
-                        guid1,
-                        Some(driver),
-                        Some(child),
-                        efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER,
-                    )
-                    .unwrap();
+            let mut expected = [child1, child2, child3];
+            expected.sort_by_key(|child| *child as usize);
+            expected.reverse();
+
+            for guid in [guid1, guid2] {
+                for child in expected {
+                    SPIN_LOCKED_PROTOCOL_DB
+                        .add_protocol_usage(
+                            controller,
+                            guid,
+                            Some(driver),
+                            Some(child),
+                            efi::OPEN_PROTOCOL_BY_CHILD_CONTROLLER,
+                        )
+                        .unwrap();
+                }
             }
 
             let child_list = SPIN_LOCKED_PROTOCOL_DB.get_child_handles(controller);
-            assert!(child_list.len() == 3);
-            for child in [child1, child2, child3] {
-                assert!(child_list.contains(&child));
-            }
+            assert_eq!(child_list, expected);
         });
     }
 }
