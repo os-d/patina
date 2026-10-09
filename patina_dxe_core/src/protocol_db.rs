@@ -583,8 +583,25 @@ impl ProtocolDb {
                 })
             })
             .collect();
+
+        let mut child_handles_by_creation: Vec<_> = child_handles
+            .iter()
+            .filter_map(|child| self.handles.get(&(*child as usize)).map(|handle| (*child, handle.order)))
+            .collect();
+        child_handles_by_creation.sort_by_key(|(_, order)| *order);
+
+        let child_handles_discovered = child_handles.clone();
+
         child_handles.sort(); //dedup needs a sorted vector
         child_handles.dedup(); //remove any duplicate handles
+
+        if !child_handles.is_empty() {
+            log::info!(
+                target: "handle_order",
+                "ConnectController children: parent={parent_handle:?}, discovered_order={child_handles_discovered:?}, creation_order={child_handles_by_creation:?}, handle_value_order={child_handles:?}"
+            );
+        }
+
         child_handles
     }
 }
