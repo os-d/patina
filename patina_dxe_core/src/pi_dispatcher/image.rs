@@ -1526,8 +1526,12 @@ fn core_load_pe_image(
     let alignment = pe_info.section_alignment as usize; // Need to align the base address with section alignment via overallocation
     let size = pe_info.size_of_image as usize;
 
-    // the section alignment must be at least the size of a page
-    if alignment == 0 || !alignment.is_multiple_of(UEFI_PAGE_SIZE) {
+    let compat_mode_required = pe_info.image_type == pecoff::EFI_IMAGE_SUBSYSTEM_EFI_APPLICATION && !pe_info.nx_compat;
+
+    // the section alignment must be at least the size of a page in order to enable memory protections. However, if
+    // we are going to enter compat mode anyway, this is a moot point, so we can allow non-page-aligned section
+    // alignment.
+    if !compat_mode_required && (alignment == 0 || !alignment.is_multiple_of(UEFI_PAGE_SIZE)) {
         log::error!(
             "core_load_pe_image failed: {pe_file_name} section alignment of {alignment:#x?} is not a multiple of page size {UEFI_PAGE_SIZE:#x?}"
         );
@@ -1565,8 +1569,7 @@ fn core_load_pe_image(
     // If we are not NX compatible and a EFI Application, we need to attempt to activate compatibility mode.
     // Compatability mode may or may not actually activate depending on how we are configured.
     // Otherwise apply the memory protections.
-    if private_info.pe_info.image_type == pecoff::EFI_IMAGE_SUBSYSTEM_EFI_APPLICATION && !private_info.pe_info.nx_compat
-    {
+    if compat_mode_required {
         private_info.activate_compatibility_mode()?;
     } else {
         // finally, update the GCD attributes for this image so that code sections have RO set and data sections
