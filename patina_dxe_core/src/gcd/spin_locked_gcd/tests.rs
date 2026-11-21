@@ -3247,6 +3247,53 @@ fn test_map_aliased_memory_region() {
 }
 
 #[test]
+fn test_map_aliased_memory_region_preserves_aliases_across_growth() {
+    with_locked_state(|| {
+        let gcd = SpinLockedGcd::new(None);
+        let mock_table = Rc::new(RefCell::new(MockPageTable::new()));
+        gcd.add_test_page_table(Box::new(MockPageTableWrapper::new(Rc::clone(&mock_table))));
+
+        let attributes = efi::MEMORY_WB | efi::MEMORY_XP;
+        let mut expected = Vec::new();
+        let mut growth_count = 0;
+        for index in 0..65 {
+            let virtual_address = 0x8000_0000 + index * 0x1000;
+            let physical_address = 0x1000_0000 + index * 0x1000;
+            let old_capacity = gcd.aliased_mappings.checked_lock().unwrap().capacity();
+            let remaining_capacity = old_capacity - expected.len();
+
+            assert_eq!(gcd.map_aliased_memory_region(virtual_address, physical_address, 0x1000, attributes), Ok(()));
+            expected.push(AliasedMapping { virtual_address, physical_address, length: 0x1000, attributes });
+            assert_eq!(gcd.get_aliased_mappings(), expected);
+
+            let new_capacity = gcd.aliased_mappings.checked_lock().unwrap().capacity();
+            if remaining_capacity < 10 {
+                assert!(new_capacity >= (old_capacity * 2).max(20));
+                growth_count += 1;
+            } else {
+                assert_eq!(new_capacity, old_capacity);
+            }
+            assert!(new_capacity - expected.len() >= 9);
+        }
+
+        assert!(growth_count > 1);
+        let mapped_regions = mock_table.borrow().get_aliased_mapped_regions();
+        assert_eq!(mapped_regions.len(), expected.len());
+        for (mapped, alias) in mapped_regions.iter().zip(&expected) {
+            assert_eq!(
+                *mapped,
+                (
+                    alias.virtual_address,
+                    alias.physical_address,
+                    alias.length,
+                    MemoryAttributes::Writeback | MemoryAttributes::ExecuteProtect,
+                )
+            );
+        }
+    });
+}
+
+#[test]
 fn test_unmap_aliased_memory_region() {
     with_locked_state(|| {
         static GCD: SpinLockedGcd = SpinLockedGcd::new(None);

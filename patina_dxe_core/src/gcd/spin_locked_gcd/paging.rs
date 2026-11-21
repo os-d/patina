@@ -273,21 +273,44 @@ impl SpinLockedGcd {
         let paging_attrs = MemoryAttributes::from_bits_truncate(attributes)
             & (MemoryAttributes::AccessAttributesMask | MemoryAttributes::CacheAttributesMask);
 
-        let mut page_table_guard = self.page_table.checked_lock()?;
-        let mut aliased_mappings_guard = self.aliased_mappings.checked_lock()?;
-        aliased_mappings_guard.try_reserve(1).map_err(|_| EfiError::OutOfResources)?;
-        let page_table = page_table_guard.as_mut().ok_or(EfiError::NotReady)?;
+        loop {
+            let mut aliased_mappings_guard = self.aliased_mappings.checked_lock()?;
+            if aliased_mappings_guard.capacity() - aliased_mappings_guard.len() >= 10 {
+                let mut page_table_guard = self.page_table.checked_lock()?;
+                let page_table = page_table_guard.as_mut().ok_or(EfiError::NotReady)?;
 
-        page_table.map_aliased_memory_region(virtual_address, physical_address, len, paging_attrs).map_err(|err| {
-            match err {
-                PagingError::OutOfResources => EfiError::OutOfResources,
-                PagingError::NoMapping => EfiError::NoMapping,
-                _ => EfiError::InvalidParameter,
+                page_table.map_aliased_memory_region(virtual_address, physical_address, len, paging_attrs).map_err(
+                    |err| match err {
+                        PagingError::OutOfResources => EfiError::OutOfResources,
+                        PagingError::NoMapping => EfiError::NoMapping,
+                        _ => EfiError::InvalidParameter,
+                    },
+                )?;
+
+                aliased_mappings_guard.push(AliasedMapping {
+                    virtual_address,
+                    physical_address,
+                    length: len,
+                    attributes,
+                });
+                return Ok(());
             }
-        })?;
 
-        aliased_mappings_guard.push(AliasedMapping { virtual_address, physical_address, length: len, attributes });
-        Ok(())
+            let required_capacity =
+                aliased_mappings_guard.capacity().checked_mul(2).ok_or(EfiError::OutOfResources)?.max(20);
+            drop(aliased_mappings_guard);
+
+            let mut replacement = Vec::new();
+            replacement.try_reserve(required_capacity).map_err(|_| EfiError::OutOfResources)?;
+
+            let mut aliased_mappings_guard = self.aliased_mappings.checked_lock()?;
+            if replacement.capacity().saturating_sub(aliased_mappings_guard.len()) >= 10 {
+                replacement.extend_from_slice(&aliased_mappings_guard);
+                core::mem::swap(&mut *aliased_mappings_guard, &mut replacement);
+            }
+            drop(aliased_mappings_guard);
+            drop(replacement);
+        }
     }
 
     pub(crate) fn unmap_aliased_memory_region(&self, virtual_address: u64, len: u64) -> Result<(), EfiError> {
