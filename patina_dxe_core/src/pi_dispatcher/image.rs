@@ -89,7 +89,7 @@ impl PrivateImageData {
     /// Creates a new `PrivateImageData` with an owned image buffer.
     fn new(mut image_info: efi::protocols::loaded_image::Protocol, pe_info: UefiPeInfo) -> Result<Self, EfiError> {
         let image_size = usize::try_from(image_info.image_size).map_err(|_| EfiError::LoadError)?;
-        let section_alignment = usize::try_from(pe_info.section_alignment).map_err(|_| EfiError::LoadError)?;
+        let section_alignment = usize::max(usize::try_from(pe_info.section_alignment).map_err(|_| EfiError::LoadError)?, UEFI_PAGE_SIZE);
 
         // if we have a unique alignment requirement, we need to overallocate the buffer to ensure we can align the base
         let page_count = if section_alignment > UEFI_PAGE_SIZE {
@@ -101,9 +101,11 @@ impl PrivateImageData {
             uefi_size_to_pages!(image_size)
         };
 
+        log::error!("OSDDEBUG: Allocating image buffer with page count {}", page_count);
         let options = AllocationOptions::new()
             .with_memory_type(EfiMemoryType::from_efi(image_info.image_code_type)?)
             .with_alignment(section_alignment);
+        log::error!("OSDDEBUG: Allocation options set with memory type {:?} and alignment {}", options.memory_type(), options.alignment());
 
         #[allow(deprecated)]
         let bytes = CoreMemoryManager.allocate_pages(page_count, options)?.into_uninitialized_boxed_slice::<u8>();
@@ -1192,6 +1194,7 @@ impl<P: super::PlatformInfo> super::PiDispatcher<P> {
         image_handle: *mut efi::Handle,
     ) -> efi::Status {
         if image_handle.is_null() {
+            log::error!("OSDDEBUG 1");
             return efi::Status::INVALID_PARAMETER;
         }
 
@@ -1213,7 +1216,9 @@ impl<P: super::PlatformInfo> super::PiDispatcher<P> {
             Ok(handle) => (handle, efi::Status::SUCCESS),
             Err(ImageStatus::AccessDenied) => (null_mut(), efi::Status::ACCESS_DENIED),
             Err(ImageStatus::SecurityViolation(handle)) => (handle, efi::Status::SECURITY_VIOLATION),
-            Err(ImageStatus::LoadError(err)) => return err.into(),
+            Err(ImageStatus::LoadError(err)) => {
+                log::error!("OSDDEBUG 2: LoadError {:?}", err);
+                return err.into()},
         };
 
         // SAFETY: Caller must ensure that image_handle is a valid pointer. It is null-checked above.
@@ -1495,6 +1500,7 @@ fn core_load_pe_image(
     image: &[u8],
     mut image_info: efi::protocols::loaded_image::Protocol,
 ) -> Result<PrivateImageData, EfiError> {
+    log::error!("OSDDEBUG: Entering core_load_pe_image");
     // parse and validate the header and retrieve the image data from it.
     let pe_info = pecoff::UefiPeInfo::parse(image).map_err(|err| {
         log::error!("core_load_pe_image failed: UefiPeInfo::parse returned {err:?}");
@@ -1538,6 +1544,8 @@ fn core_load_pe_image(
         return Err(EfiError::LoadError);
     }
 
+    log::error!("OSDDEBUG: Section alignment is {alignment:#x?}, size is {size:#x?}");
+
     // the size of the image must be a multiple of the section alignment per PE/COFF spec
     if size == 0 || !size.is_multiple_of(alignment) {
         log::error!(
@@ -1545,7 +1553,7 @@ fn core_load_pe_image(
         );
         return Err(EfiError::LoadError);
     }
-
+    log::error!("OSDDEBUG: Validating sections");
     // every section must lie within the image that is about to be allocated, so nothing derived from the section
     // headers (relocations, memory protections) can refer to memory outside of the image.
     pe_info.validate_sections().map_err(|err| {
@@ -1553,6 +1561,7 @@ fn core_load_pe_image(
         EfiError::LoadError
     })?;
 
+    log::error!("OSDDEBUG: Setting image info");
     image_info.image_size = size as u64;
     image_info.image_code_type = code_type;
     image_info.image_data_type = data_type;
@@ -1560,7 +1569,9 @@ fn core_load_pe_image(
     //allocate a buffer to hold the image (also updates private_info.image_info.image_base)
     let mut private_info = PrivateImageData::new(image_info, pe_info)?;
 
+    log::error!("OSDDEBUG 3: Private image data allocated");
     private_info.load_image(image)?;
+    log::error!("OSDDEBUG 4: Image loaded into private info");
 
     private_info.relocate_image()?;
 
