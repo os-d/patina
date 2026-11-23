@@ -89,7 +89,8 @@ impl PrivateImageData {
     /// Creates a new `PrivateImageData` with an owned image buffer.
     fn new(mut image_info: efi::protocols::loaded_image::Protocol, pe_info: UefiPeInfo) -> Result<Self, EfiError> {
         let image_size = usize::try_from(image_info.image_size).map_err(|_| EfiError::LoadError)?;
-        let section_alignment = usize::max(usize::try_from(pe_info.section_alignment).map_err(|_| EfiError::LoadError)?, UEFI_PAGE_SIZE);
+        let section_alignment =
+            usize::max(usize::try_from(pe_info.section_alignment).map_err(|_| EfiError::LoadError)?, UEFI_PAGE_SIZE);
 
         // if we have a unique alignment requirement, we need to overallocate the buffer to ensure we can align the base
         let page_count = if section_alignment > UEFI_PAGE_SIZE {
@@ -105,7 +106,11 @@ impl PrivateImageData {
         let options = AllocationOptions::new()
             .with_memory_type(EfiMemoryType::from_efi(image_info.image_code_type)?)
             .with_alignment(section_alignment);
-        log::error!("OSDDEBUG: Allocation options set with memory type {:?} and alignment {}", options.memory_type(), options.alignment());
+        log::error!(
+            "OSDDEBUG: Allocation options set with memory type {:?} and alignment {}",
+            options.memory_type(),
+            options.alignment()
+        );
 
         #[allow(deprecated)]
         let bytes = CoreMemoryManager.allocate_pages(page_count, options)?.into_uninitialized_boxed_slice::<u8>();
@@ -172,7 +177,10 @@ impl PrivateImageData {
             })?;
         let size = resource_section.len();
 
-        let alignment = usize::try_from(self.pe_info.section_alignment).map_err(|_| EfiError::LoadError)?;
+        let alignment = align_up(
+            usize::try_from(self.pe_info.section_alignment).map_err(|_| EfiError::LoadError)?,
+            UEFI_PAGE_SIZE,
+        )?;
         let memory_type = EfiMemoryType::from_efi(self.image_info.image_code_type)?;
 
         // if we have a unique alignment requirement, we need to overallocate the buffer to ensure we can align the base
@@ -1218,7 +1226,8 @@ impl<P: super::PlatformInfo> super::PiDispatcher<P> {
             Err(ImageStatus::SecurityViolation(handle)) => (handle, efi::Status::SECURITY_VIOLATION),
             Err(ImageStatus::LoadError(err)) => {
                 log::error!("OSDDEBUG 2: LoadError {:?}", err);
-                return err.into()},
+                return err.into();
+            }
         };
 
         // SAFETY: Caller must ensure that image_handle is a valid pointer. It is null-checked above.
